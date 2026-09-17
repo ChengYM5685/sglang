@@ -4,7 +4,7 @@ import functools
 import logging
 from contextlib import contextmanager
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
 
 import torch
 import triton
@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _ATTN_DP_RANK: Optional[int] = None
@@ -762,20 +763,27 @@ def is_dp_gatherv_active() -> bool:
     )
 
 
-def _dp_gatherv_sizes(forward_batch) -> Optional[List[int]]:
-    """Per-rank CPU token counts for the buffer being gathered. The MoE gather
-    passes a ForwardBatch (global_num_tokens_cpu); the logits gather passes a
-    LogitsMetadata (global_num_tokens_for_logprob_cpu). Return the sizes that
-    match the LOCAL tensor for this context, or None to fall back."""
-    sizes = getattr(forward_batch, "global_num_tokens_for_logprob_cpu", None)
-    if sizes is None:
-        sizes = getattr(forward_batch, "global_num_tokens_cpu", None)
+def _dp_gatherv_sizes(
+    forward_batch: ForwardBatch | LogitsMetadata,
+    *,
+    count_source: Literal["forward", "logits"],
+) -> Optional[List[int]]:
+    """Use the caller's row layout, never infer it from a matching total.
+
+    MoE/input gathers use the buffer-aligned forward counts, also used by
+    reduce_scatterv. The LM head uses the counts of its pruned hidden states.
+    Missing CPU counts must fall back to the existing tensor-based collective,
+    not to counts belonging to a different layout.
+    """
+    if count_source == "logits":
+        sizes = forward_batch.global_num_tokens_for_logprob_cpu
+    elif count_source == "forward":
+        sizes = get_dp_global_num_tokens()
+    else:
+        raise ValueError(f"Unknown DP gather count source: {count_source}")
     if sizes is None:
         return None
-    try:
-        return [int(x) for x in sizes]
-    except (TypeError, ValueError):
-        return None
+    return [int(x) for x in sizes]
 
 
 def _dp_gather_via_all_gatherv(
@@ -800,9 +808,9 @@ def _dp_gather_via_all_gatherv(
     else:
         local_real = local_tokens.new_zeros((local_rows, *local_tokens.shape[1:]))
         local_real[: local_tokens.shape[0]].copy_(local_tokens)
-    # sum(sizes) == global_tokens.shape[0] is guaranteed by the caller (else it
-    # falls back to all_reduce). Pass global_tokens as the NCCL output buffer so
-    # the gather writes directly into it -- avoids the previous extra full-buffer
+    # sum(sizes) == global_tokens.shape[0] is validated by the caller.
+    # Pass global_tokens as the NCCL output buffer so the gather writes directly
+    # into it -- avoids the previous extra full-buffer
     # torch.cat + copy_ (two ~sum(sizes)*hidden DtoD copies, ~700us/layer at c512).
     # NOTE: the fp8 branch condition must be identical on EVERY DP rank (all
     # ranks must issue the same NCCL op sequence) — env/dtype/hidden are
@@ -829,8 +837,10 @@ def _note_dp_gather_in_prefill_graph() -> None:
 def _dp_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
-    forward_batch: ForwardBatch,
+    forward_batch: ForwardBatch | LogitsMetadata,
     is_partial: bool,
+    *,
+    count_source: Literal["forward", "logits"] = "forward",
 ):
     _note_dp_gather_in_prefill_graph()
     if (
@@ -838,20 +848,22 @@ def _dp_gather(
         and forward_batch.dp_padding_mode is not None
         and not forward_batch.dp_padding_mode.is_max_len()
     ):
-        # The gatherv per-rank sizes MUST sum to the pre-allocated global buffer
-        # (the MoE runs on the whole buffer, so any unfilled tail = garbage).
-        # The buffer was sized from the ceil_align'd global_num_tokens stored via
-        # set_dp_buffer_len (forward_batch_info), so the authoritative sizes are
-        # get_dp_global_num_tokens() — the SAME source the reduce_scatterv combine
-        # uses (symmetric). _dp_gatherv_sizes() reads the raw (un-aligned, and for
-        # the MoE-gather context the logprob-token) counts, which do NOT match the
-        # buffer for prefill steps -> would force an all_reduce fallback.
-        # Prefer the buffer-aligned sizes; fall back to the per-batch sizes only
-        # if they happen to match (e.g. the logits gather path).
-        _gatherv_sizes = get_dp_global_num_tokens()
-        if _gatherv_sizes is None or sum(_gatherv_sizes) != global_tokens.shape[0]:
-            _gatherv_sizes = _dp_gatherv_sizes(forward_batch)
-        if _gatherv_sizes is not None and sum(_gatherv_sizes) == global_tokens.shape[0]:
+        # A materialized MegaMoE idle rank has synthetic forward counts [1]*DP.
+        # Their total can match the logits buffer while their per-rank layout
+        # differs. Every rank must select counts for the same operation, or the
+        # equal-size all_gatherv fast path can diverge from its peers.
+        _gatherv_sizes = _dp_gatherv_sizes(forward_batch, count_source=count_source)
+        if _gatherv_sizes is not None:
+            if (
+                len(_gatherv_sizes) != get_attention_dp_size()
+                or any(size < 0 for size in _gatherv_sizes)
+                or sum(_gatherv_sizes) != global_tokens.shape[0]
+            ):
+                raise ValueError(
+                    f"DP gather {count_source} counts {_gatherv_sizes} do not match "
+                    f"DP size {get_attention_dp_size()} and destination rows "
+                    f"{global_tokens.shape[0]}"
+                )
             _dp_gather_via_all_gatherv(
                 global_tokens, local_tokens, forward_batch, is_partial, _gatherv_sizes
             )
@@ -872,17 +884,33 @@ def _dp_gather(
 def dp_gather_partial(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
-    forward_batch: ForwardBatch,
+    forward_batch: ForwardBatch | LogitsMetadata,
+    *,
+    count_source: Literal["forward", "logits"] = "forward",
 ):
-    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
+    _dp_gather(
+        global_tokens,
+        local_tokens,
+        forward_batch,
+        is_partial=True,
+        count_source=count_source,
+    )
 
 
 def dp_gather_replicate(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
-    forward_batch: ForwardBatch,
+    forward_batch: ForwardBatch | LogitsMetadata,
+    *,
+    count_source: Literal["forward", "logits"] = "forward",
 ):
-    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=False)
+    _dp_gather(
+        global_tokens,
+        local_tokens,
+        forward_batch,
+        is_partial=False,
+        count_source=count_source,
+    )
 
 
 def dp_scatter(

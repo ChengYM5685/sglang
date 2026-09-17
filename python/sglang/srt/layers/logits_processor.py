@@ -941,7 +941,12 @@ class LogitsProcessor(nn.Module):
                 global_shape=tuple(hidden_states.shape),
                 local_shape=tuple(local_hidden_states.shape),
             )
-            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            dp_gather_replicate(
+                hidden_states,
+                local_hidden_states,
+                logits_metadata,
+                count_source="logits",
+            )
             _trace_e2e_logits("dp_hidden_gather_collective_returned")
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
