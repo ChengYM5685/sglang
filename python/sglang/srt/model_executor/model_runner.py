@@ -1704,7 +1704,7 @@ class ModelRunner:
             )
 
         if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end()
+            self.eplb_manager.on_forward_pass_end(forward_batch)
 
         if dumper.may_enable:
             dumper.step()
