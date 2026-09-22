@@ -8,6 +8,7 @@ import sglang.srt.layers.moe.token_dispatcher.moriepv2 as adapter
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.moriepv2 import (
     MoriEPv2Dispatcher,
+    _mori_epv2_recv_bound_decision,
     _resolve_tbo_geometry,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -115,13 +116,115 @@ def test_recv_capacity_api_compatibility(monkeypatch, dynamic, comm_stream):
     op.dispatch.assert_called_once_with(None, None, None, None, **kwargs)
 
 
-@pytest.mark.parametrize("rows,expected", [(0, 32), (35, 64), (448, 512), (8192, 8192)])
-def test_optional_recv_bound_does_not_import_an_unavailable_dispatcher(rows, expected):
-    dispatcher = SimpleNamespace(
-        op=SimpleNamespace(cfg=SimpleNamespace(effective_max_recv=65536)),
-        _trim_recv=True,
+@pytest.mark.parametrize(
+    "sender_rows,rank,expected,reason",
+    [
+        ([1] * 8, 0, 32, "trimmed_dedup"),
+        ([7] * 8, 0, 64, "trimmed_dedup"),
+        ([56] * 8, 3, 512, "trimmed_dedup"),
+        ([448] * 8, 7, 4096, "trimmed_dedup"),
+        ([0, 1, 7, 33, 56, 128, 257, 448], 3, 1024, "trimmed_dedup"),
+        ([0, 1, 7, 33, 56, 128, 257, 448], 0, 1024, "trimmed_dedup"),
+        ([8192] * 8, 0, 65536, "no_saving"),
+        ([0] * 8, 0, 65536, "no_saving"),
+    ],
+)
+def test_epv2_deduplicated_bound(sender_rows, rank, expected, reason):
+    decision = _mori_epv2_recv_bound_decision(
+        enabled=True,
+        physical_rows=65536,
+        local_rows=sender_rows[rank],
+        sender_rows=sender_rows,
+        ep_size=8,
+        ep_rank=rank,
+        tp_size=8,
+        attn_dp_size=8,
+        attn_dp_rank=rank,
+        moe_tp_size=1,
+        moe_dp_size=1,
+        tbo_enabled=False,
+        kernel_backend="flydsl",
     )
-    assert MoriEPv2Dispatcher._select_recv_cap(dispatcher, rows) == expected
+    assert decision.rows == expected
+    assert decision.reason == reason
+
+
+@pytest.mark.parametrize(
+    "overrides,reason",
+    [
+        ({"enabled": False}, "disabled"),
+        ({"sender_rows": None}, "metadata_missing"),
+        ({"sender_rows": [7] * 7}, "metadata_invalid"),
+        ({"sender_rows": [7] * 7 + [-1]}, "metadata_invalid"),
+        ({"local_rows": 8}, "metadata_mismatch"),
+        ({"explicit_cluster_rows": 57}, "metadata_mismatch"),
+        ({"tp_size": 16}, "sender_mapping_unknown"),
+        ({"attn_dp_size": 4}, "sender_mapping_unknown"),
+        ({"attn_dp_rank": 1}, "sender_mapping_unknown"),
+        ({"moe_tp_size": 2}, "sender_mapping_unknown"),
+        ({"moe_dp_size": 2}, "sender_mapping_unknown"),
+        ({"tbo_enabled": True}, "tbo_metadata_missing"),
+        ({"kernel_backend": "hip"}, "layout_unverified"),
+        ({"sender_rows": [9000] * 8, "local_rows": 9000}, "capacity_unproven"),
+    ],
+)
+def test_epv2_bound_falls_back_when_safety_is_unproved(overrides, reason):
+    kwargs = {
+        "enabled": True,
+        "physical_rows": 65536,
+        "local_rows": 7,
+        "sender_rows": [7] * 8,
+        "ep_size": 8,
+        "ep_rank": 0,
+        "tp_size": 8,
+        "attn_dp_size": 8,
+        "attn_dp_rank": 0,
+        "moe_tp_size": 1,
+        "moe_dp_size": 1,
+        "tbo_enabled": False,
+        "kernel_backend": "flydsl",
+        "explicit_cluster_rows": None,
+    }
+    kwargs.update(overrides)
+    decision = _mori_epv2_recv_bound_decision(**kwargs)
+    assert decision.rows == 65536
+    assert decision.reason == reason
+
+
+def test_select_recv_cap_uses_current_nonuniform_sender_snapshot(monkeypatch):
+    sender_rows = [0, 1, 7, 33, 56, 128, 257, 448]
+    rank = 3
+    monkeypatch.setattr(
+        adapter,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            moe_ep_size=8,
+            moe_ep_rank=rank,
+            tp_size=8,
+            attn_dp_size=8,
+            attn_dp_rank=rank,
+            moe_tp_size=1,
+            moe_dp_size=1,
+            launch_world_rank=rank,
+        ),
+    )
+    dispatcher = SimpleNamespace(
+        op=SimpleNamespace(
+            cfg=SimpleNamespace(effective_max_recv=65536), backend_name="flydsl"
+        ),
+        _trim_recv=True,
+        _tbo_enabled=False,
+        _num_tokens=sender_rows[rank],
+    )
+    assert (
+        MoriEPv2Dispatcher._select_recv_cap(
+            dispatcher,
+            explicit_cluster_rows=sum(sender_rows),
+            sender_rows=sender_rows,
+        )
+        == 1024
+    )
+    assert dispatcher._recv_bound_reason == "trimmed_dedup"
 
 
 if __name__ == "__main__":
