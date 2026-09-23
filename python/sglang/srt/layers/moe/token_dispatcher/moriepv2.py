@@ -64,11 +64,12 @@ def _mori_epv2_recv_bound_decision(
     moe_dp_size: int,
     tbo_enabled: bool,
     kernel_backend: str,
+    is_internode: bool,
     explicit_cluster_rows: Optional[int] = None,
 ) -> _MoriEPv2RecvBoundDecision:
     """Select a safe logical receive view for EPv2's token-major layout.
 
-    The intranode FlyDSL dispatcher allocates one dense receive row per
+    The validated intranode FlyDSL and HIP dispatchers allocate one dense row per
     ``(source token, destination rank)``.  Therefore the sum of the sender input
     rows is a safe fan-in bound, independent of router top-k.  This helper only
     uses that fact when DP scheduler metadata maps one-to-one to the EP senders
@@ -82,7 +83,7 @@ def _mori_epv2_recv_bound_decision(
         return _MoriEPv2RecvBoundDecision(full, "invalid_capacity", None)
     if tbo_enabled:
         return _MoriEPv2RecvBoundDecision(full, "tbo_metadata_missing", None)
-    if kernel_backend != "flydsl":
+    if is_internode or kernel_backend not in ("flydsl", "hip"):
         return _MoriEPv2RecvBoundDecision(full, "layout_unverified", None)
     if (
         ep_size <= 1
@@ -482,6 +483,7 @@ class MoriEPv2Dispatcher(BaseDispatcher):
             moe_dp_size=getattr(parallel, "moe_dp_size", -1),
             tbo_enabled=self._tbo_enabled,
             kernel_backend=getattr(self.op, "backend_name", "unknown"),
+            is_internode=getattr(self.op.cfg, "is_internode", True),
             explicit_cluster_rows=explicit_cluster_rows,
         )
         self._recv_bound_reason = decision.reason

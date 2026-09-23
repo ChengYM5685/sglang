@@ -1,11 +1,14 @@
 """Eight-GPU MORI EPv2 FP4-asymmetric two-child TBO coverage."""
 
+import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
 
+import sglang.srt.layers.dp_attention as dp_attention
 import sglang.srt.layers.moe.token_dispatcher.moriepv2 as adapter
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.environ import envs
@@ -60,6 +63,12 @@ def main():
     adapter.get_parallel = lambda: SimpleNamespace(
         moe_ep_size=world_size,
         moe_ep_rank=rank,
+        tp_size=world_size,
+        attn_dp_size=world_size,
+        attn_dp_rank=rank,
+        moe_tp_size=1,
+        moe_dp_size=1,
+        launch_world_rank=rank,
         world_rank=rank,
     )
     group = _Group(dist.group.WORLD)
@@ -84,12 +93,21 @@ def main():
     for child in children:
         child.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
     assert children[0].op is not children[1].op
+    probe_trim = os.environ.get("PROBE_TBO_TRIM", "0") == "1"
+    if probe_trim:
+        # Validation-only probe: keep the real shared TBO stream/dispatchers,
+        # but allow each child to consume metadata snapshotted immediately
+        # before its dispatch_a. Production remains conservatively gated off.
+        for child in children:
+            child._tbo_enabled = False
 
     failures = torch.zeros(1, dtype=torch.int32)
     inputs = []
-    for child_id, token_counts in enumerate(
-        ((12, 0, 7, 2, 9, 0, 4, 1), (0, 11, 3, 0, 5, 8, 1, 6))
-    ):
+    child_token_counts = (
+        (12, 0, 7, 2, 9, 0, 4, 1),
+        (0, 11, 3, 0, 5, 8, 1, 6),
+    )
+    for child_id, token_counts in enumerate(child_token_counts):
         tokens = token_counts[rank]
         generator = torch.Generator(device="cpu").manual_seed(
             20260805 + child_id * 100 + rank
@@ -110,19 +128,30 @@ def main():
         inputs.append((hidden, ids, StandardTopKOutput(weights, ids, None)))
 
     for child_id, (hidden, _ids, topk_output) in enumerate(inputs):
+        token_counts = child_token_counts[child_id]
+        dp_attention.set_dp_buffer_len(
+            sum(token_counts), token_counts[rank], False, list(token_counts)
+        )
         dispatcher.dispatch_a(
             tbo_subbatch_index=child_id,
             hidden_states=hidden,
             topk_output=topk_output,
-            dynamic_recv_cluster_rows=sum(
-                (12, 0, 7, 2, 9, 0, 4, 1)
-                if child_id == 0
-                else (0, 11, 3, 0, 5, 8, 1, 6)
-            ),
+            dynamic_recv_cluster_rows=sum(token_counts),
         )
     outputs = [
         dispatcher.dispatch_b(tbo_subbatch_index=child_id) for child_id in range(2)
     ]
+    for child_id, (child, output) in enumerate(zip(children, outputs)):
+        if probe_trim:
+            expected_cap = max(
+                adapter.MORI_EPV2_MIN_LOGICAL_RECV_ROWS,
+                1 << (sum(child_token_counts[child_id]) - 1).bit_length(),
+            )
+            assert child._recv_bound_reason == "trimmed_dedup"
+            assert output.recv_cap == expected_cap
+        else:
+            assert child._recv_bound_reason == "tbo_metadata_missing"
+            assert output.recv_cap == child.op.cfg.effective_max_recv
     for child_id, output in enumerate(outputs):
         dispatcher.combine_a(
             tbo_subbatch_index=child_id,
@@ -145,11 +174,20 @@ def main():
             failures += 1
     dist.all_reduce(failures)
     if rank == 0:
+        summary = {
+            "status": "PASS" if failures.item() == 0 else "FAIL",
+            "probe_trim": probe_trim,
+            "recv_caps": [output.recv_cap for output in outputs],
+            "bound_reasons": [child._recv_bound_reason for child in children],
+            "child_sender_rows": child_token_counts,
+            "failures": failures.item(),
+        }
         print(
-            "# MORI-EPV2-FP4-TBO: "
-            f"{'PASS' if failures.item() == 0 else 'FAIL'} failures={failures.item()}",
+            "# MORI-EPV2-FP4-TBO: " + json.dumps(summary, sort_keys=True),
             flush=True,
         )
+        if result_json := os.environ.get("RESULT_JSON"):
+            Path(result_json).write_text(json.dumps(summary, indent=2) + "\n")
     for child in children:
         child.op.close()
         child.op.comm.destroy()

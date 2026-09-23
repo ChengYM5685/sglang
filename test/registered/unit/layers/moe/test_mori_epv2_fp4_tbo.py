@@ -144,6 +144,7 @@ def test_epv2_deduplicated_bound(sender_rows, rank, expected, reason):
         moe_dp_size=1,
         tbo_enabled=False,
         kernel_backend="flydsl",
+        is_internode=False,
     )
     assert decision.rows == expected
     assert decision.reason == reason
@@ -164,7 +165,9 @@ def test_epv2_deduplicated_bound(sender_rows, rank, expected, reason):
         ({"moe_tp_size": 2}, "sender_mapping_unknown"),
         ({"moe_dp_size": 2}, "sender_mapping_unknown"),
         ({"tbo_enabled": True}, "tbo_metadata_missing"),
-        ({"kernel_backend": "hip"}, "layout_unverified"),
+        ({"kernel_backend": "unknown"}, "layout_unverified"),
+        ({"is_internode": True}, "layout_unverified"),
+        ({"kernel_backend": "hip", "is_internode": True}, "layout_unverified"),
         ({"sender_rows": [9000] * 8, "local_rows": 9000}, "capacity_unproven"),
     ],
 )
@@ -183,12 +186,56 @@ def test_epv2_bound_falls_back_when_safety_is_unproved(overrides, reason):
         "moe_dp_size": 1,
         "tbo_enabled": False,
         "kernel_backend": "flydsl",
+        "is_internode": False,
         "explicit_cluster_rows": None,
     }
     kwargs.update(overrides)
     decision = _mori_epv2_recv_bound_decision(**kwargs)
     assert decision.rows == 65536
     assert decision.reason == reason
+
+
+def test_epv2_hip_intranode_deduplicated_bound():
+    decision = _mori_epv2_recv_bound_decision(
+        enabled=True,
+        physical_rows=65536,
+        local_rows=56,
+        sender_rows=[56] * 8,
+        ep_size=8,
+        ep_rank=0,
+        tp_size=8,
+        attn_dp_size=8,
+        attn_dp_rank=0,
+        moe_tp_size=1,
+        moe_dp_size=1,
+        tbo_enabled=False,
+        kernel_backend="hip",
+        is_internode=False,
+    )
+    assert decision.rows == 512
+    assert decision.reason == "trimmed_dedup"
+
+
+@pytest.mark.parametrize("ep_size,expected", [(2, 128), (4, 256)])
+def test_epv2_deduplicated_bound_for_smaller_ep_groups(ep_size, expected):
+    decision = _mori_epv2_recv_bound_decision(
+        enabled=True,
+        physical_rows=ep_size * 8192,
+        local_rows=56,
+        sender_rows=[56] * ep_size,
+        ep_size=ep_size,
+        ep_rank=0,
+        tp_size=ep_size,
+        attn_dp_size=ep_size,
+        attn_dp_rank=0,
+        moe_tp_size=1,
+        moe_dp_size=1,
+        tbo_enabled=False,
+        kernel_backend="flydsl",
+        is_internode=False,
+    )
+    assert decision.rows == expected
+    assert decision.reason == "trimmed_dedup"
 
 
 def test_select_recv_cap_uses_current_nonuniform_sender_snapshot(monkeypatch):
@@ -210,7 +257,8 @@ def test_select_recv_cap_uses_current_nonuniform_sender_snapshot(monkeypatch):
     )
     dispatcher = SimpleNamespace(
         op=SimpleNamespace(
-            cfg=SimpleNamespace(effective_max_recv=65536), backend_name="flydsl"
+            cfg=SimpleNamespace(effective_max_recv=65536, is_internode=False),
+            backend_name="flydsl",
         ),
         _trim_recv=True,
         _tbo_enabled=False,
