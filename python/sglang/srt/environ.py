@@ -851,6 +851,8 @@ class Envs:
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
     SGLANG_MORI_EP_VERSION = EnvStr("epv1")
     SGLANG_MORI_DISPATCH_DTYPE = EnvStr("auto")
+    # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
+    # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.
     SGLANG_MORI_RECV_BOUND = EnvBool(False)
     SGLANG_MORI_EPV2_PER_RANK_VMM_GB = EnvInt(4)
 

@@ -4,7 +4,7 @@ import functools
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Sequence
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
@@ -20,6 +20,11 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPPDispatchHooks
+from sglang.srt.layers.moe.token_dispatcher.mori_recv_bound import (
+    MoriRecvBoundDecision,
+    mori_recv_bound_decision,
+    normalize_sender_rows,
+)
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
@@ -54,6 +59,26 @@ if _use_aiter:
     from aiter import QuantType, get_hip_quant
 
 logger = logging.getLogger(__name__)
+_RECV_BOUND_LOGGED: set[tuple[str, int]] = set()
+
+
+def _mori_epv2_recv_bound_decision(
+    *,
+    kernel_backend: str,
+    is_internode: bool,
+    pow2_buckets: bool = False,
+    **kwargs,
+) -> MoriRecvBoundDecision:
+    """Select a safe logical receive view for EPv2's token-major layout.
+
+    Only the intranode FlyDSL and HIP dispatchers have a verified dense,
+    destination-deduplicated receive layout.
+    """
+    return mori_recv_bound_decision(
+        layout_verified=not is_internode and kernel_backend in ("flydsl", "hip"),
+        pow2_buckets=pow2_buckets,
+        **kwargs,
+    )
 
 
 def _should_record_expert_distribution() -> bool:
@@ -112,6 +137,8 @@ class MoriEPNormalDispatchOutput(NamedTuple):
     expert_output: Optional[torch.Tensor] = None
     # None lets the runner choose a bound; 0 disables trimming.
     recv_cap: Optional[int] = None
+    # mori.ops.EpDispatchCombineKernelType that produced the receive layout.
+    kernel_type: Any = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -129,6 +156,8 @@ class MoriEPLLDispatchOutput(NamedTuple):
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype
+    # mori.ops.EpDispatchCombineKernelType that produced the receive layout.
+    kernel_type: Any = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -898,6 +927,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPv1DispatcherImplBase):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
+            kernel_type=self.mori_op.config.kernel_type,
         )
 
     def _dispatch_core(
@@ -1120,6 +1150,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPv1DispatcherImplBase):
             origin_topk_ids=topk_ids,
             origin_topk_weights=topk_weights,
             out_dtype=output_dtype,
+            kernel_type=self.mori_op.config.kernel_type,
         )
 
     def _dispatch_core(
@@ -1202,9 +1233,11 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
         os.environ.setdefault("AITER_FLYDSL_EP_NO_FAKE_EXPERT", "1")
         self.async_finish = async_finish
         tbo_enabled = is_tbo_enabled()
+        self._tbo_enabled = tbo_enabled
         # Receive trimming falls back when sender metadata is unavailable,
         # including TBO children without per-rank token counts.
         self._trim_recv = envs.SGLANG_MORI_RECV_BOUND.get()
+        self._recv_cap_pow2_buckets = False
         # Disable direct output for TBO to preserve buffer/stream ownership.
         self._direct_output = not tbo_enabled and get_bool_env_var(
             "SGLANG_MORI_EPV2_AITER_DIRECT_OUTPUT", "true"
@@ -1253,6 +1286,8 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             self._launch_config,
         )
         prepare_recv_cap = getattr(self._mori_op, "prepare_recv_cap", None)
+        # Keep logical caps on the power-of-two ladder prepared below.
+        self._recv_cap_pow2_buckets = prepare_recv_cap is not None
         if prepare_recv_cap is None:
             return
         graph_cap_max = get_int_env_var("SGLANG_MORI_EPV2_GRAPH_RECV_CAP_MAX", 8192)
@@ -1267,43 +1302,64 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             self._initialize_op()
         return self._mori_op
 
-    def _select_recv_cap(self, eager_cluster_rows: Optional[int] = None):
-        if not self._trim_recv:
-            return self.mori_op.cfg.effective_max_recv
-
-        if eager_cluster_rows is not None:
-            # Keep the optional MORI API independent from the separate FlyDSL
-            # dispatcher, which is not part of this SGLang source tree.
-            cluster_rows = int(eager_cluster_rows)
-            physical_cap = self.mori_op.cfg.effective_max_recv
-            if cluster_rows < 0 or physical_cap <= 0:
-                raise ValueError(
-                    f"Invalid MORI EPv2 capacity: {cluster_rows=}, {physical_cap=}"
-                )
-            eager_cap = min(
-                physical_cap, max(32, 1 << (max(1, cluster_rows) - 1).bit_length())
-            )
-            if not eager_cap & (eager_cap - 1):
-                return eager_cap
+    @staticmethod
+    def _snapshot_sender_rows() -> tuple[int, ...] | None:
         from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 
-        per_rank_tokens = get_dp_global_num_tokens()
-        if (
-            self._num_tokens <= 0
-            or not per_rank_tokens
-            or any(rows != self._num_tokens for rows in per_rank_tokens)
-        ):
-            return self.mori_op.cfg.effective_max_recv
+        return normalize_sender_rows(get_dp_global_num_tokens())
 
-        from sglang.srt.layers.moe.moe_runner.aiter import _mori_decode_recv_bound
+    def _select_recv_cap(
+        self,
+        explicit_cluster_rows: Optional[int] = None,
+        sender_rows: Optional[Sequence[int]] = None,
+    ) -> int:
+        physical_rows = self.mori_op.cfg.effective_max_recv
+        if not self._trim_recv:
+            self._recv_bound_reason = "disabled"
+            self._recv_bound_sender_rows = None
+            return physical_rows
 
-        return (
-            _mori_decode_recv_bound(
-                self.mori_op.cfg.effective_max_recv,
-                self.router_topk,
-            )
-            or self.mori_op.cfg.effective_max_recv
+        parallel = get_parallel()
+        decision = _mori_epv2_recv_bound_decision(
+            enabled=True,
+            physical_rows=physical_rows,
+            local_rows=self._num_tokens,
+            sender_rows=(
+                self._snapshot_sender_rows() if sender_rows is None else sender_rows
+            ),
+            ep_size=parallel.moe_ep_size,
+            ep_rank=parallel.moe_ep_rank,
+            tp_size=parallel.tp_size,
+            attn_dp_size=parallel.attn_dp_size,
+            attn_dp_rank=parallel.attn_dp_rank,
+            moe_tp_size=parallel.moe_tp_size,
+            moe_dp_size=parallel.moe_dp_size,
+            tbo_enabled=self._tbo_enabled,
+            # Older MORI builds lack these fields; the defaults fall back to the full view.
+            kernel_backend=getattr(self.mori_op, "backend_name", "unknown"),
+            is_internode=getattr(self.mori_op.cfg, "is_internode", True),
+            explicit_cluster_rows=explicit_cluster_rows,
+            pow2_buckets=self._recv_cap_pow2_buckets,
         )
+        self._recv_bound_reason = decision.reason
+        self._recv_bound_sender_rows = decision.sender_rows
+        if parallel.launch_world_rank == 0:
+            key = (decision.reason, decision.rows)
+            if key not in _RECV_BOUND_LOGGED:
+                _RECV_BOUND_LOGGED.add(key)
+                log = (
+                    logger.info if decision.reason == "trimmed_dedup" else logger.debug
+                )
+                log(
+                    "MORI EPv2 recv bound: physical=%d logical=%d reason=%s "
+                    "sender_rows=%s local_rows=%d",
+                    physical_rows,
+                    decision.rows,
+                    decision.reason,
+                    decision.sender_rows,
+                    self._num_tokens,
+                )
+        return decision.rows
 
     def dispatch_a(self, hidden_states, topk_output, dynamic_recv_cluster_rows=None):
         if hidden_states.dtype != torch.bfloat16:
@@ -1312,6 +1368,14 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
                 f"hidden_states.dtype={hidden_states.dtype}"
             )
         self._dynamic_recv_cluster_rows = dynamic_recv_cluster_rows
+        # Snapshot the CPU scheduler metadata for this exact dispatch.  Reading
+        # the process-global value later in dispatch_b can observe a different
+        # TBO child or forward when dispatch_a/dispatch_b are separated.
+        self._dispatch_sender_rows = (
+            self._snapshot_sender_rows()
+            if self._trim_recv and not self._tbo_enabled
+            else None
+        )
         return super().dispatch_a(hidden_states, topk_output)
 
     def _prepare_topk(self, topk_output):
@@ -1323,7 +1387,10 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
     def dispatch_b(
         self, hidden_states, topk_weights, topk_ids, scale, output_dtype, ready_event
     ) -> DispatchOutput:
-        recv_cap = self._select_recv_cap(self._dynamic_recv_cluster_rows)
+        recv_cap = self._select_recv_cap(
+            self._dynamic_recv_cluster_rows,
+            self._dispatch_sender_rows,
+        )
         kwargs = {"return_routing": True}
         if hasattr(self.mori_op, "prepare_recv_cap"):
             kwargs.update(recv_cap=recv_cap, clone_routing=False)

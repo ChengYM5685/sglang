@@ -6,8 +6,12 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
+import sglang.srt.layers.dp_attention as dp_attention
 import sglang.srt.layers.moe.token_dispatcher.moriep as adapter
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.token_dispatcher.mori_recv_bound import (
+    round_logical_recv_rows,
+)
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 
@@ -93,11 +97,20 @@ def main():
     if os.environ.get("EMPTY_LAST_RANK", "0") == "1" and rank == world_size - 1:
         tokens = 0
 
+    sender_rows = [None] * world_size
+    dist.all_gather_object(sender_rows, tokens)
+    dp_attention.set_dp_buffer_len(sum(sender_rows), tokens, False, sender_rows)
+
     adapter.is_tbo_enabled = lambda: False
     adapter.get_parallel = lambda: SimpleNamespace(
         moe_ep_size=world_size,
         moe_ep_rank=rank,
-        world_rank=rank,
+        tp_size=world_size,
+        attn_dp_size=world_size,
+        attn_dp_rank=rank,
+        moe_tp_size=1,
+        moe_dp_size=1,
+        launch_world_rank=rank,
     )
     group = _Group(dist.group.WORLD)
     envs.SGLANG_MORI_EP_VERSION.set("epv2")
@@ -134,6 +147,16 @@ def main():
     topk_output = StandardTopKOutput(topk_weights, topk_ids, None)
 
     dispatched = dispatcher.dispatch(hidden, topk_output)
+    impl = dispatcher._get_impl()
+    expected_cap = 0
+    if impl._trim_recv:
+        cluster_rows = sum(sender_rows)
+        expected_cap = impl.mori_op.cfg.effective_max_recv
+        if 0 < cluster_rows < expected_cap:
+            expected_cap = round_logical_recv_rows(
+                cluster_rows, pow2_buckets=impl._recv_cap_pow2_buckets
+            )
+    assert dispatched.recv_cap == expected_cap
     combined = dispatcher.combine(
         (
             _expert_output(dispatched, fp4_enabled, fp4_lookup),

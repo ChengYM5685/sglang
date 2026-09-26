@@ -115,5 +115,97 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     assert output.hidden_states.shape == (0, 2, 4)
 
 
+_FAKE_KERNEL_TYPE = SimpleNamespace(
+    IntraNode="IntraNode",
+    AsyncLL="AsyncLL",
+    InterNodeV1="InterNodeV1",
+    InterNodeV1LL="InterNodeV1LL",
+)
+
+
+def _patch_epv1_recv_bound(
+    monkeypatch, *, sender_rows, rank=0, tbo=False, ep_size=None
+):
+    import sglang.srt.layers.dp_attention as dp_attention
+    import sglang.srt.layers.moe.utils as moe_utils
+
+    fake_mori = ModuleType("mori")
+    fake_mori.ops = SimpleNamespace(EpDispatchCombineKernelType=_FAKE_KERNEL_TYPE)
+    monkeypatch.setitem(sys.modules, "mori", fake_mori)
+    monkeypatch.setenv("SGLANG_MORI_RECV_BOUND", "1")
+    monkeypatch.setattr(dp_attention, "get_dp_global_num_tokens", lambda: sender_rows)
+    monkeypatch.setattr(moe_utils, "is_tbo_enabled", lambda: tbo)
+    ep_size = ep_size or len(sender_rows)
+    monkeypatch.setattr(
+        aiter_runner,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            moe_ep_size=ep_size,
+            moe_ep_rank=rank,
+            tp_size=ep_size,
+            attn_dp_size=ep_size,
+            attn_dp_rank=rank,
+            moe_tp_size=1,
+            moe_dp_size=1,
+            launch_world_rank=1,
+        ),
+    )
+
+
+@pytest.mark.parametrize("kernel_type", ["IntraNode", "AsyncLL"])
+@pytest.mark.parametrize(
+    "sender_rows,rank,expected",
+    [
+        ([1] * 8, 0, 32),
+        ([56] * 8, 3, 448),
+        ([0, 1, 7, 33, 56, 128, 257, 448], 3, 960),
+        ([0, 1, 7, 56], 0, 64),
+        ([0, 56], 0, 64),
+    ],
+)
+def test_epv1_recv_bound_uses_sender_sum_not_topk(
+    monkeypatch, kernel_type, sender_rows, rank, expected
+):
+    _patch_epv1_recv_bound(monkeypatch, sender_rows=sender_rows, rank=rank)
+    rows, reason = aiter_runner._mori_epv1_recv_bound(
+        recv_rows=8 * 4096, local_rows=sender_rows[rank], kernel_type=kernel_type
+    )
+    assert (rows, reason) == (expected, "trimmed_dedup")
+
+
+@pytest.mark.parametrize(
+    "overrides,reason",
+    [
+        ({"kernel_type": "InterNodeV1"}, "layout_unverified"),
+        ({"kernel_type": "InterNodeV1LL"}, "layout_unverified"),
+        ({"kernel_type": None}, "layout_unverified"),
+        ({"local_rows": 8}, "metadata_mismatch"),
+        ({"sender_rows": None}, "metadata_missing"),
+        ({"sender_rows": [7] * 7}, "metadata_invalid"),
+        ({"tbo": True}, "tbo_metadata_missing"),
+        ({"recv_rows": 64}, "no_saving"),
+        ({"recv_rows": 40}, "capacity_unproven"),
+        ({"enabled": False}, "disabled"),
+    ],
+)
+def test_epv1_recv_bound_keeps_full_view_when_unproved(monkeypatch, overrides, reason):
+    sender_rows = overrides.get("sender_rows", [7] * 8)
+    _patch_epv1_recv_bound(
+        monkeypatch,
+        sender_rows=sender_rows,
+        tbo=overrides.get("tbo", False),
+        ep_size=8,
+    )
+    if not overrides.get("enabled", True):
+        monkeypatch.setenv("SGLANG_MORI_RECV_BOUND", "0")
+    recv_rows = overrides.get("recv_rows", 32768)
+    rows, got_reason = aiter_runner._mori_epv1_recv_bound(
+        recv_rows=recv_rows,
+        local_rows=overrides.get("local_rows", 7),
+        kernel_type=overrides.get("kernel_type", "IntraNode"),
+    )
+    assert (rows, got_reason) == (recv_rows, reason)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
