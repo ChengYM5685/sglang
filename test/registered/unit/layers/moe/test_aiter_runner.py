@@ -124,7 +124,7 @@ _FAKE_KERNEL_TYPE = SimpleNamespace(
 
 
 def _patch_epv1_recv_bound(
-    monkeypatch, *, sender_rows, rank=0, tbo=False, ep_size=None
+    monkeypatch, *, sender_rows, rank=0, tbo=False, ep_size=None, attn_tp_size=1
 ):
     import sglang.srt.layers.dp_attention as dp_attention
     import sglang.srt.layers.moe.utils as moe_utils
@@ -143,8 +143,11 @@ def _patch_epv1_recv_bound(
             moe_ep_size=ep_size,
             moe_ep_rank=rank,
             tp_size=ep_size,
-            attn_dp_size=ep_size,
-            attn_dp_rank=rank,
+            attn_dp_size=ep_size // attn_tp_size,
+            attn_dp_rank=rank // attn_tp_size,
+            attn_tp_size=attn_tp_size,
+            attn_tp_rank=rank % attn_tp_size,
+            attn_cp_size=1,
             moe_tp_size=1,
             moe_dp_size=1,
             launch_world_rank=1,
@@ -171,6 +174,17 @@ def test_epv1_recv_bound_uses_sender_sum_not_topk(
         recv_rows=8 * 4096, local_rows=sender_rows[rank], kernel_type=kernel_type
     )
     assert (rows, reason) == (expected, "trimmed_dedup")
+
+
+@pytest.mark.parametrize("kernel_type", ["IntraNode", "AsyncLL"])
+def test_epv1_recv_bound_trims_attention_tp_scatter(monkeypatch, kernel_type):
+    """Without DP attention the local tensor_split chunk bounds the batch, even when
+    global_num_tokens is stale from the target step (DSpark draft forwards)."""
+    _patch_epv1_recv_bound(monkeypatch, sender_rows=[1152], rank=7, ep_size=8, attn_tp_size=8)
+    rows, reason = aiter_runner._mori_epv1_recv_bound(
+        recv_rows=8 * 4096, local_rows=7, kernel_type=kernel_type
+    )
+    assert (rows, reason) == (64, "trimmed_dedup")
 
 
 @pytest.mark.parametrize(

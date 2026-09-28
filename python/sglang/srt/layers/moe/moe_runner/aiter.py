@@ -173,6 +173,9 @@ def _mori_epv1_recv_bound(
         tp_size=parallel.tp_size,
         attn_dp_size=parallel.attn_dp_size,
         attn_dp_rank=parallel.attn_dp_rank,
+        attn_tp_size=parallel.attn_tp_size,
+        attn_tp_rank=parallel.attn_tp_rank,
+        attn_cp_size=parallel.attn_cp_size,
         moe_tp_size=parallel.moe_tp_size,
         moe_dp_size=parallel.moe_dp_size,
         tbo_enabled=enabled and is_tbo_enabled(),
@@ -183,8 +186,7 @@ def _mori_epv1_recv_bound(
         key = (decision.reason, decision.rows)
         if key not in _RECV_BOUND_LOGGED:
             _RECV_BOUND_LOGGED.add(key)
-            log = logger.info if decision.reason == "trimmed_dedup" else logger.debug
-            log(
+            logger.info(
                 "MORI EPv1 recv bound: physical=%d logical=%d reason=%s "
                 "sender_rows=%s local_rows=%d kernel=%s",
                 recv_rows,

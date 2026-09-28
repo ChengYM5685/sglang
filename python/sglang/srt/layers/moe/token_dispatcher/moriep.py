@@ -1332,6 +1332,9 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             tp_size=parallel.tp_size,
             attn_dp_size=parallel.attn_dp_size,
             attn_dp_rank=parallel.attn_dp_rank,
+            attn_tp_size=parallel.attn_tp_size,
+            attn_tp_rank=parallel.attn_tp_rank,
+            attn_cp_size=parallel.attn_cp_size,
             moe_tp_size=parallel.moe_tp_size,
             moe_dp_size=parallel.moe_dp_size,
             tbo_enabled=self._tbo_enabled,
@@ -1347,10 +1350,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             key = (decision.reason, decision.rows)
             if key not in _RECV_BOUND_LOGGED:
                 _RECV_BOUND_LOGGED.add(key)
-                log = (
-                    logger.info if decision.reason == "trimmed_dedup" else logger.debug
-                )
-                log(
+                logger.info(
                     "MORI EPv2 recv bound: physical=%d logical=%d reason=%s "
                     "sender_rows=%s local_rows=%d",
                     physical_rows,

@@ -11,6 +11,7 @@ import sglang.srt.layers.moe.token_dispatcher.moriep as adapter
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.mori_recv_bound import (
     round_logical_recv_rows,
+    scattered_rows,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
@@ -97,17 +98,34 @@ def main():
     if os.environ.get("EMPTY_LAST_RANK", "0") == "1" and rank == world_size - 1:
         tokens = 0
 
-    sender_rows = [None] * world_size
-    dist.all_gather_object(sender_rows, tokens)
-    dp_attention.set_dp_buffer_len(sum(sender_rows), tokens, False, sender_rows)
+    # ATTN_TP > 1 models attention TP: each DP group's TOKENS * (group + 1) rows
+    # are tensor_split over its attention-TP ranks, as the model does before MoE.
+    attn_tp_size = int(os.environ.get("ATTN_TP", "1"))
+    attn_dp_size = world_size // attn_tp_size
+    attn_dp_rank, attn_tp_rank = divmod(rank, attn_tp_size)
+    if attn_tp_size == 1:
+        sender_rows = [None] * world_size
+        dist.all_gather_object(sender_rows, tokens)
+    else:
+        sender_rows = [tokens * (group + 1) for group in range(attn_dp_size)]
+        tokens = scattered_rows(
+            sender_rows[attn_dp_rank], parts=attn_tp_size, index=attn_tp_rank
+        )
+    # STALE_ROWS models DSpark draft forwards that keep the target step's metadata.
+    stale_rows = os.environ.get("STALE_ROWS")
+    metadata_rows = [int(stale_rows)] if stale_rows else sender_rows
+    dp_attention.set_dp_buffer_len(sum(sender_rows), tokens, False, metadata_rows)
 
     adapter.is_tbo_enabled = lambda: False
     adapter.get_parallel = lambda: SimpleNamespace(
         moe_ep_size=world_size,
         moe_ep_rank=rank,
         tp_size=world_size,
-        attn_dp_size=world_size,
-        attn_dp_rank=rank,
+        attn_dp_size=attn_dp_size,
+        attn_dp_rank=attn_dp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_tp_rank=attn_tp_rank,
+        attn_cp_size=1,
         moe_tp_size=1,
         moe_dp_size=1,
         launch_world_rank=rank,
@@ -132,7 +150,12 @@ def main():
         tokens, hidden_size, generator=generator, dtype=torch.bfloat16
     ).cuda()
     if os.environ.get("SKEWED", "0") == "1":
-        topk_ids = torch.arange(topk, dtype=torch.int32).repeat(tokens, 1).cuda()
+        first_expert = int(os.environ.get("SKEW_RANK", "0")) * experts_per_rank
+        topk_ids = (
+            torch.arange(first_expert, first_expert + topk, dtype=torch.int32)
+            .repeat(tokens, 1)
+            .cuda()
+        )
     else:
         topk_ids = torch.randint(
             0,
@@ -150,13 +173,20 @@ def main():
     impl = dispatcher._get_impl()
     expected_cap = 0
     if impl._trim_recv:
-        cluster_rows = sum(sender_rows)
+        cluster_rows = (
+            sum(sender_rows)
+            if attn_dp_size > 1
+            else attn_tp_size * tokens + attn_tp_rank
+        )
         expected_cap = impl.mori_op.cfg.effective_max_recv
         if 0 < cluster_rows < expected_cap:
             expected_cap = round_logical_recv_rows(
                 cluster_rows, pow2_buckets=impl._recv_cap_pow2_buckets
             )
     assert dispatched.recv_cap == expected_cap
+    recv_rows = int(dispatched.num_recv_tokens_per_expert.reshape(-1)[0].item())
+    assert recv_rows <= sum(sender_rows), (recv_rows, sender_rows)
+    assert expected_cap == 0 or recv_rows <= expected_cap, (recv_rows, expected_cap)
     combined = dispatcher.combine(
         (
             _expert_output(dispatched, fp4_enabled, fp4_lookup),
@@ -183,7 +213,9 @@ def main():
             f"{'PASS' if failures.item() == 0 else 'FAIL'} "
             f"tokens={tokens} hidden={hidden_size} topk={topk} "
             f"skewed={os.environ.get('SKEWED', '0')} "
-            f"empty_last_rank={os.environ.get('EMPTY_LAST_RANK', '0')}",
+            f"empty_last_rank={os.environ.get('EMPTY_LAST_RANK', '0')} "
+            f"attn_tp={attn_tp_size} sender_rows={sender_rows} stale_rows={stale_rows} "
+            f"recv_cap={dispatched.recv_cap}",
             f"fp4={fp4_enabled}",
             f"mean_abs_error={error.mean().item():.6f}",
             f"max_abs_error={error.max().item() if error.numel() else 0:.6f}",

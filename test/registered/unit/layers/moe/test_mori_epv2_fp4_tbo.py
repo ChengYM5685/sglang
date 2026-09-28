@@ -207,6 +207,9 @@ def test_epv2_deduplicated_bound(
         tp_size=8,
         attn_dp_size=8,
         attn_dp_rank=rank,
+        attn_tp_size=1,
+        attn_tp_rank=0,
+        attn_cp_size=1,
         moe_tp_size=1,
         moe_dp_size=1,
         tbo_enabled=False,
@@ -229,7 +232,15 @@ def test_epv2_deduplicated_bound(
         ({"explicit_cluster_rows": 57}, "metadata_mismatch"),
         ({"tp_size": 16}, "sender_mapping_unknown"),
         ({"attn_dp_size": 4}, "sender_mapping_unknown"),
-        ({"attn_dp_rank": 1}, "sender_mapping_unknown"),
+        ({"attn_dp_rank": 8}, "sender_mapping_unknown"),
+        ({"attn_cp_size": 2}, "sender_mapping_unknown"),
+        ({"attn_dp_size": 1, "attn_tp_size": 4}, "sender_mapping_unknown"),
+        ({"attn_dp_size": 1, "attn_tp_size": 8, "attn_tp_rank": 8}, "sender_mapping_unknown"),
+        ({"attn_dp_size": 1, "attn_tp_size": 8, "local_rows": -1}, "metadata_invalid"),
+        (
+            {"attn_dp_size": 1, "attn_tp_size": 8, "explicit_cluster_rows": 57},
+            "metadata_mismatch",
+        ),
         ({"moe_tp_size": 2}, "sender_mapping_unknown"),
         ({"moe_dp_size": 2}, "sender_mapping_unknown"),
         ({"tbo_enabled": True}, "tbo_metadata_missing"),
@@ -250,6 +261,9 @@ def test_epv2_bound_falls_back_when_safety_is_unproved(overrides, reason):
         "tp_size": 8,
         "attn_dp_size": 8,
         "attn_dp_rank": 0,
+        "attn_tp_size": 1,
+        "attn_tp_rank": 0,
+        "attn_cp_size": 1,
         "moe_tp_size": 1,
         "moe_dp_size": 1,
         "tbo_enabled": False,
@@ -263,6 +277,82 @@ def test_epv2_bound_falls_back_when_safety_is_unproved(overrides, reason):
     assert decision.reason == reason
 
 
+@pytest.mark.parametrize(
+    "attn_dp_size,group_rows,rank,expected",
+    [
+        # DP attention with attention TP 2: each DP group split over two ranks.
+        (4, [16, 0, 33, 64], 5, 128),
+        (4, [16, 0, 33, 64], 2, 128),
+    ],
+)
+def test_epv2_bound_sums_attention_tp_scattered_groups(
+    attn_dp_size, group_rows, rank, expected
+):
+    attn_tp_size = 8 // attn_dp_size
+    attn_dp_rank, attn_tp_rank = divmod(rank, attn_tp_size)
+    local_rows = torch.arange(group_rows[attn_dp_rank]).tensor_split(attn_tp_size)[
+        attn_tp_rank
+    ].numel()
+    decision = _mori_epv2_recv_bound_decision(
+        enabled=True,
+        physical_rows=65536,
+        local_rows=local_rows,
+        sender_rows=group_rows,
+        ep_size=8,
+        ep_rank=rank,
+        tp_size=8,
+        attn_dp_size=attn_dp_size,
+        attn_dp_rank=attn_dp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_tp_rank=attn_tp_rank,
+        attn_cp_size=1,
+        moe_tp_size=1,
+        moe_dp_size=1,
+        tbo_enabled=False,
+        kernel_backend="flydsl",
+        is_internode=False,
+    )
+    assert (decision.rows, decision.reason) == (expected, "trimmed_dedup")
+
+
+
+@pytest.mark.parametrize("stale_sender_rows", [None, [1152], [8]])
+def test_epv2_bound_without_dp_attention_ignores_stale_metadata(stale_sender_rows):
+    """Without DP attention, DSpark draft forwards keep the target step's
+    global_num_tokens; e.g. a stale 1152 against a real 1153-row draft batch must
+    never bound a rank below the rows it can receive."""
+    decisions = []
+    for total_rows in [1153, 1160, 16384, 1151, 1152, *range(0, 80)]:
+        for rank, chunk in enumerate(torch.arange(total_rows).tensor_split(8)):
+            decision = _mori_epv2_recv_bound_decision(
+                enabled=True,
+                physical_rows=131072,
+                local_rows=chunk.numel(),
+                sender_rows=stale_sender_rows,
+                ep_size=8,
+                ep_rank=rank,
+                tp_size=8,
+                attn_dp_size=1,
+                attn_dp_rank=0,
+                attn_tp_size=8,
+                attn_tp_rank=rank,
+                attn_cp_size=1,
+                moe_tp_size=1,
+                moe_dp_size=1,
+                tbo_enabled=False,
+                kernel_backend="flydsl",
+                is_internode=False,
+            )
+            decisions.append((total_rows, rank, decision))
+
+    assert [(t, r, d.rows) for t, r, d in decisions if d.rows < t] == []
+    for total_rows, _, decision in decisions:
+        if total_rows > 0:
+            # Local-only slack is at most 2 * attn_tp_size - 1 rows before rounding.
+            assert decision.reason == "trimmed_dedup"
+            assert decision.rows < total_rows + 15 + 32
+
+
 def test_epv2_hip_intranode_deduplicated_bound():
     decision = _mori_epv2_recv_bound_decision(
         enabled=True,
@@ -274,6 +364,9 @@ def test_epv2_hip_intranode_deduplicated_bound():
         tp_size=8,
         attn_dp_size=8,
         attn_dp_rank=0,
+        attn_tp_size=1,
+        attn_tp_rank=0,
+        attn_cp_size=1,
         moe_tp_size=1,
         moe_dp_size=1,
         tbo_enabled=False,
@@ -296,6 +389,9 @@ def test_epv2_deduplicated_bound_for_smaller_ep_groups(ep_size, expected):
         tp_size=ep_size,
         attn_dp_size=ep_size,
         attn_dp_rank=0,
+        attn_tp_size=1,
+        attn_tp_rank=0,
+        attn_cp_size=1,
         moe_tp_size=1,
         moe_dp_size=1,
         tbo_enabled=False,
@@ -318,6 +414,9 @@ def test_select_recv_cap_uses_current_nonuniform_sender_snapshot(monkeypatch):
             tp_size=8,
             attn_dp_size=8,
             attn_dp_rank=rank,
+            attn_tp_size=1,
+            attn_tp_rank=0,
+            attn_cp_size=1,
             moe_tp_size=1,
             moe_dp_size=1,
             launch_world_rank=rank,
