@@ -1,4 +1,9 @@
-"""Eight-GPU MORI EPv2 FP4-asymmetric two-child TBO coverage."""
+"""Eight-GPU MORI EPv2 FP4-asymmetric two-child TBO coverage.
+
+Set TEST_CUDA_GRAPH=1 to capture and replay REPLAY_ITERS times (default 3).
+SGLANG_MORI_EPV2_AITER_DIRECT_OUTPUT=0/1 exercises staging or direct writes.
+The identity expert below checks buffer correctness, not AITER performance.
+"""
 
 import json
 import os
@@ -134,57 +139,114 @@ def main():
         ).cuda()
         inputs.append((hidden, ids, StandardTopKOutput(weights, ids, None)))
 
-    for child_id, (hidden, _ids, topk_output) in enumerate(inputs):
-        token_counts = child_token_counts[child_id]
-        dp_attention.set_dp_buffer_len(
-            sum(token_counts), token_counts[rank], False, list(token_counts)
-        )
-        dispatcher.dispatch_a(
-            tbo_subbatch_index=child_id,
-            hidden_states=hidden,
-            topk_output=topk_output,
-        )
-    outputs = [
-        dispatcher.dispatch_b(tbo_subbatch_index=child_id) for child_id in range(2)
-    ]
-    for child_id, (child, output) in enumerate(zip(children, outputs)):
-        if child._manual_recv_cap > 0:
-            assert output.recv_cap == min(
-                child._manual_recv_cap, child.mori_op.cfg.effective_max_recv
+    def run_step():
+        for child_id, (hidden, _ids, topk_output) in enumerate(inputs):
+            token_counts = child_token_counts[child_id]
+            dp_attention.set_dp_buffer_len(
+                sum(token_counts), token_counts[rank], False, list(token_counts)
             )
-        elif probe_trim:
-            expected_cap = round_logical_recv_rows(
-                sum(child_token_counts[child_id]),
-                pow2_buckets=child._recv_cap_pow2_buckets,
+            dispatcher.dispatch_a(
+                tbo_subbatch_index=child_id,
+                hidden_states=hidden,
+                topk_output=topk_output,
             )
-            assert output.recv_cap == expected_cap
-        else:
-            assert output.recv_cap == child.mori_op.cfg.effective_max_recv
-    for child_id, output in enumerate(outputs):
-        dispatcher.combine_a(
-            tbo_subbatch_index=child_id,
-            combine_input=(_dequantize(output), output.topk_ids, output.topk_weights),
-        )
-    actual = [
-        dispatcher.combine_b(tbo_subbatch_index=child_id)[
-            : inputs[child_id][0].shape[0]
+        outputs = [
+            dispatcher.dispatch_b(tbo_subbatch_index=child_id) for child_id in range(2)
         ]
-        for child_id in range(2)
-    ]
+        direct_views = []
+        for child_id, (child, output) in enumerate(zip(children, outputs)):
+            if child._manual_recv_cap > 0:
+                assert output.recv_cap == min(
+                    child._manual_recv_cap, child.mori_op.cfg.effective_max_recv
+                )
+            elif not child._trim_recv:
+                assert output.recv_cap == 0
+            elif probe_trim:
+                expected_cap = round_logical_recv_rows(
+                    sum(child_token_counts[child_id]),
+                    pow2_buckets=child._recv_cap_pow2_buckets,
+                )
+                assert output.recv_cap == expected_cap
+            else:
+                assert output.recv_cap == child.mori_op.cfg.effective_max_recv
+            expected_direct = child._direct_output and callable(
+                getattr(child.mori_op, "combine_in_view", None)
+            )
+            assert (output.expert_output is not None) == expected_direct
+            if output.expert_output is not None:
+                assert (
+                    output.expert_output.data_ptr()
+                    == child.mori_op.combine_in_view().data_ptr()
+                )
+                direct_views.append(output.expert_output.data_ptr())
+        assert len(direct_views) == len(set(direct_views)), (
+            "TBO children share an output buffer"
+        )
+        for child_id, output in enumerate(outputs):
+            expert_out = _dequantize(output)
+            if output.expert_output is not None:
+                direct_out = output.expert_output[: expert_out.shape[0]]
+                direct_out.copy_(expert_out)
+                expert_out = direct_out
+            dispatcher.combine_a(
+                tbo_subbatch_index=child_id,
+                combine_input=(expert_out, output.topk_ids, output.topk_weights),
+            )
+        actual = [
+            dispatcher.combine_b(tbo_subbatch_index=child_id)[
+                : inputs[child_id][0].shape[0]
+            ]
+            for child_id in range(2)
+        ]
+        return actual, outputs
+
+    def check(actual, atol=0.6, rtol=0.6):
+        torch.cuda.synchronize()
+        for child_id, (hidden, ids, _topk_output) in enumerate(inputs):
+            if not torch.allclose(
+                actual[child_id].float().cpu(),
+                _expected(hidden, ids, experts_per_rank).float(),
+                atol=atol,
+                rtol=rtol,
+            ):
+                failures.add_(1)
+
+    replay_iters = int(os.environ.get("REPLAY_ITERS", "3"))
+    assert replay_iters > 0
+    use_graph = os.environ.get("TEST_CUDA_GRAPH", "0") == "1"
+    graph = None
+    # Exercise random FP4 inputs and warm up both instances before graph capture.
+    for _ in range(2 if use_graph else 1):
+        actual, outputs = run_step()
+        check(actual)
+    if use_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual, outputs = run_step()
+        graph.replay()
+        check(actual)
+    for iteration in range(replay_iters):
+        # Change values and routing while retaining the captured input addresses.
+        for child_id, (hidden, ids, _topk_output) in enumerate(inputs):
+            # Powers of two are exact in FP4; opposite signs expose child aliasing.
+            value = 2.0 ** (iteration % 4 - 3)
+            hidden.fill_(value if child_id == 0 else -2 * value)
+            ids.copy_((ids + 13) % num_experts)
+        if graph is None:
+            actual, outputs = run_step()
+        else:
+            graph.replay()
+        check(actual, atol=2e-2, rtol=2e-2)
+    graph = None
     torch.cuda.synchronize()
-    for child_id, (hidden, ids, _topk_output) in enumerate(inputs):
-        if not torch.allclose(
-            actual[child_id].float().cpu(),
-            _expected(hidden, ids, experts_per_rank).float(),
-            atol=0.6,
-            rtol=0.6,
-        ):
-            failures += 1
     dist.all_reduce(failures)
     if rank == 0:
         summary = {
             "status": "PASS" if failures.item() == 0 else "FAIL",
             "probe_trim": probe_trim,
+            "direct_output": [output.expert_output is not None for output in outputs],
+            "cuda_graph": use_graph,
+            "replay_iters": replay_iters,
             "recv_caps": [output.recv_cap for output in outputs],
             "child_sender_rows": child_token_counts,
             "failures": failures.item(),

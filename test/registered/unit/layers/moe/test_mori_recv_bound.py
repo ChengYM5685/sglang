@@ -41,7 +41,6 @@ def make_dispatcher(monkeypatch):
 
     def make(
         kind,
-        *,
         enabled=True,
         manual_cap=0,
         recv_rows=65536,
@@ -98,7 +97,7 @@ def make_dispatcher(monkeypatch):
     return make
 
 
-def _recv_bound_parallel(*, ep_size=8, rank=0, attn_tp_size=1):
+def _recv_bound_parallel(ep_size=8, rank=0, attn_tp_size=1):
     return SimpleNamespace(
         moe_ep_size=ep_size,
         moe_ep_rank=rank,

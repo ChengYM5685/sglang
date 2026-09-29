@@ -119,7 +119,7 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
 def test_aiter_runner_uses_epv2_output_when_kernel_supports_it(
     monkeypatch, supports_output
 ):
-    def fused_moe(*, hidden_states, output=None, **kwargs):
+    def fused_moe(hidden_states, output=None, **kwargs):
         result = hidden_states + 2
         if output is not None:
             output.copy_(result)

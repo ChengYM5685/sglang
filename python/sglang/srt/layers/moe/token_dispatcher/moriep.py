@@ -74,7 +74,7 @@ def normalize_sender_rows(
     return tuple(int(rows) for rows in sender_rows)
 
 
-def round_logical_recv_rows(cluster_rows: int, *, pow2_buckets: bool) -> int:
+def round_logical_recv_rows(cluster_rows: int, pow2_buckets: bool) -> int:
     # Measured on MI355X with DSV4 FP4 AITER fused MoE: latency tracks the logical
     # M and a new M costs no JIT, so power-of-two padding only pays off for a
     # backend that pre-builds power-of-two receive caps.
@@ -155,6 +155,17 @@ def _aiter_supports_mxfp8_dispatch() -> bool:
         )
     except Exception:
         return False
+
+
+@functools.lru_cache(maxsize=1)
+def _mori_fp8_direct_cast_saturates() -> bool:
+    # Older MORI fp8_direct_cast combine (EPv1 and EPv2) emits NaN past the fp8 max;
+    # the fix added this EPv2 helper. Drop once the minimum MORI carries the fix.
+    try:
+        from mori.ops.dispatch_combine_v2 import intranode_kernels
+    except ImportError:
+        return False
+    return hasattr(intranode_kernels, "_direct_cast_fp8_max")
 
 
 class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
@@ -531,7 +542,7 @@ def _get_tbo_comm_stream(group, tbo_enabled: bool, async_finish: bool):
 
 
 @lru_cache(maxsize=4)
-def _init_cco_communicator(group, instance_id: int):
+def _init_cco_communicator(group, instance_id: int, per_rank_vmm_gb: int):
     from mori.cco import Communicator
 
     parallel = get_parallel()
@@ -544,9 +555,6 @@ def _init_cco_communicator(group, instance_id: int):
 
     uid = Communicator.get_unique_id() if rank == 0 else None
     uid = group.broadcast_object(uid, src=0)
-    per_rank_vmm_gb = envs.SGLANG_MORI_EPV2_PER_RANK_VMM_GB.get()
-    if per_rank_vmm_gb <= 0:
-        raise ValueError("SGLANG_MORI_EPV2_PER_RANK_VMM_GB must be positive")
     comm = Communicator.init(
         world_size,
         rank,
@@ -564,6 +572,66 @@ def _init_cco_communicator(group, instance_id: int):
     return comm
 
 
+def _epv2_arena_bytes(cfg) -> int:
+    """Upper bound of the MORI EPv2 intranode symmetric arena for `cfg`."""
+    cap = cfg.effective_max_recv
+    topk = cfg.num_experts_per_token
+    # The hip backend pads scale rows to 128 B; flydsl uses the unpadded row.
+    scale_row = -(-cfg.scale_dim * cfg.scale_type_size // 128) * 128
+    per_recv_row = (
+        cfg.token_nbytes + cfg.combine_token_nbytes + scale_row + topk * 8 + 4
+    )
+    total = cap * per_recv_row + cfg.world_size * 12
+    if cfg.is_scatter:
+        scatter_rows = cfg.world_size * cfg.max_num_inp_token_per_rank
+        scatter_row = cfg.hidden_dim * cfg.wire_elem_size + topk * 4
+        if cfg.fp8_blockwise:
+            scatter_row += cfg.combine_scale_dim * 4
+        total += scatter_rows * scatter_row
+    # SymmArena aligns each of its (at most 12) regions to 256 B.
+    return total + 12 * 256
+
+
+# Arbitrary floor: the former fixed per-rank cco window.
+_EPV2_MIN_PER_RANK_VMM_GB = 4
+
+
+def _epv2_per_rank_vmm_gb(cfg) -> int:
+    required_gb = -(-_epv2_arena_bytes(cfg) // (1 << 30))
+    per_rank_vmm_gb = envs.SGLANG_MORI_EPV2_PER_RANK_VMM_GB.get()
+    if per_rank_vmm_gb is None:
+        return max(_EPV2_MIN_PER_RANK_VMM_GB, required_gb)
+    if per_rank_vmm_gb < required_gb:
+        raise ValueError(
+            f"SGLANG_MORI_EPV2_PER_RANK_VMM_GB={per_rank_vmm_gb} is below the "
+            f"{required_gb} GiB MORI EPv2 arena for this config; raise it, "
+            "lower SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK, or unset it"
+        )
+    return per_rank_vmm_gb
+
+
+# MORI EPv2 per-token scale layout: (scale_dim, bytes per scale) for each dispatch dtype.
+_EPV2_DISPATCH_SCALES = {
+    DispatchDtype.bf16: (0, 0),
+    DispatchDtype.fp8: (FP8_BLOCK_SIZE, torch.float32.itemsize),
+    DispatchDtype.fp4: (MXFP4_BLOCK_SIZE, torch.float8_e8m0fnu.itemsize),
+    DispatchDtype.mxfp8: (MXFP4_BLOCK_SIZE, torch.float8_e8m0fnu.itemsize),
+}
+_EPV2_COMBINE_QUANT = {
+    CombineDtype.bf16: "none",
+    CombineDtype.fp8: "fp8_blockwise",
+    CombineDtype.fp8_direct_cast: "fp8_direct_cast",
+}
+
+
+def _epv2_dispatch_torch_dtype(dispatch_dtype: DispatchDtype) -> torch.dtype:
+    if dispatch_dtype == DispatchDtype.bf16:
+        return torch.bfloat16
+    if dispatch_dtype == DispatchDtype.fp4:
+        return torch.float4_e2m1fn_x2
+    return fp8_dtype
+
+
 @lru_cache(maxsize=4)
 def init_mori_epv2_op(
     group,
@@ -575,7 +643,8 @@ def init_mori_epv2_op(
     max_tokens_per_rank: int,
     instance_id: int = 0,
     max_total_recv_tokens: int = 0,
-    dispatch_dtype: torch.dtype = torch.bfloat16,
+    dispatch_dtype: DispatchDtype = DispatchDtype.bf16,
+    combine_dtype: CombineDtype = CombineDtype.bf16,
     launch_config: _MoriEPv2LaunchConfig = _MoriEPv2LaunchConfig(
         None, None, None, None
     ),
@@ -590,13 +659,21 @@ def init_mori_epv2_op(
             "MORI EPv2 requires BF16 expert/combine output; "
             f"got params_dtype={params_dtype}"
         )
-    if dispatch_dtype not in (torch.bfloat16, torch.float4_e2m1fn_x2):
-        raise ValueError(f"unsupported MORI EPv2 dispatch dtype: {dispatch_dtype}")
+    if combine_dtype not in _EPV2_COMBINE_QUANT:
+        raise ValueError(f"unsupported MORI EPv2 combine dtype: {combine_dtype}")
+    # MORI EPv2 quantizes the combine wire only on a symmetric bf16 op (scatter mode).
+    if combine_dtype != CombineDtype.bf16 and dispatch_dtype != DispatchDtype.bf16:
+        raise ValueError(
+            f"MORI EPv2 combine dtype {combine_dtype} requires bf16 dispatch; "
+            f"got {dispatch_dtype}"
+        )
+    transport_dtype = _epv2_dispatch_torch_dtype(dispatch_dtype)
+    is_asymmetric = transport_dtype != torch.bfloat16
+    scale_block, scale_type_size = _EPV2_DISPATCH_SCALES[dispatch_dtype]
 
     parallel = get_parallel()
     world_size = parallel.moe_ep_size
     rank = parallel.moe_ep_rank
-    comm = _init_cco_communicator(group, instance_id)
     cfg = EpDispatchCombineConfig(
         rank=rank,
         world_size=world_size,
@@ -605,28 +682,29 @@ def init_mori_epv2_op(
         num_experts_per_rank=num_local_experts,
         num_experts_per_token=router_topk,
         data_type=torch.bfloat16,
-        dispatch_data_type=(
-            dispatch_dtype if dispatch_dtype != torch.bfloat16 else None
-        ),
-        combine_data_type=(
-            torch.bfloat16 if dispatch_dtype != torch.bfloat16 else None
-        ),
-        scale_dim=(
-            hidden_size // MXFP4_BLOCK_SIZE if dispatch_dtype != torch.bfloat16 else 0
-        ),
-        scale_type_size=1 if dispatch_dtype != torch.bfloat16 else 0,
+        dispatch_data_type=transport_dtype if is_asymmetric else None,
+        combine_data_type=torch.bfloat16 if is_asymmetric else None,
+        scale_dim=hidden_size // scale_block if scale_block else 0,
+        scale_type_size=scale_type_size,
         combine_mode="gather",
+        quant_type=_EPV2_COMBINE_QUANT[combine_dtype],
         max_total_recv_tokens=max_total_recv_tokens,
         dispatch_block_num=launch_config.dispatch_block_num,
         combine_block_num=launch_config.combine_block_num,
         warp_num_per_block=launch_config.dispatch_warp_num_per_block,
         combine_warp_num_per_block=launch_config.combine_warp_num_per_block,
     )
+    comm = _init_cco_communicator(
+        group=group,
+        instance_id=instance_id,
+        per_rank_vmm_gb=_epv2_per_rank_vmm_gb(cfg),
+    )
     op = EpDispatchCombineOp(cfg, comm)
     comm.barrier()
     logger.info(
         "[MORI EPv2 init] world=%d rank=%d hidden=%d experts=%d local_experts=%d "
-        "topk=%d max_tokens=%d recv_cap=%d dispatch_dtype=%s launch_config=%s schedule=%s",
+        "topk=%d max_tokens=%d recv_cap=%d dispatch_dtype=%s combine_dtype=%s "
+        "combine_mode=%s launch_config=%s schedule=%s",
         world_size,
         rank,
         hidden_size,
@@ -636,6 +714,8 @@ def init_mori_epv2_op(
         max_tokens_per_rank,
         cfg.effective_max_recv,
         dispatch_dtype,
+        combine_dtype,
+        cfg.combine_mode,
         launch_config,
         cfg.schedule,
     )
@@ -826,22 +906,24 @@ class _MoriEPDispatcherImplBase:
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
         weight_dtype = quant_config.get("weight_dtype")
-        self.dispatch_dtype = (
-            DispatchDtype.fp4
-            if weight_dtype == torch.float4_e2m1fn_x2
-            else DispatchDtype.bf16
-        )
+        self.dispatch_dtype = DispatchDtype.bf16
+        if weight_dtype == torch.float4_e2m1fn_x2:
+            self.dispatch_dtype = DispatchDtype.fp4
+        elif weight_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            self.dispatch_dtype = DispatchDtype.fp8
         if self._is_epv2:
             self._apply_dispatch_dtype_override()
-            if self.dispatch_dtype == DispatchDtype.fp4 and self.fp4_quant_func is None:
+            # All EPv2 quant funcs are bound together, only when Aiter is available.
+            if (
+                self.dispatch_dtype != DispatchDtype.bf16
+                and self.fp4_quant_func is None
+            ):
                 raise RuntimeError(
-                    "MORI EPv2 FP4 dispatch requires Aiter per_1x32 quantization"
+                    f"MORI EPv2 {self.dispatch_dtype} dispatch requires Aiter quantization"
                 )
             if self._mori_op is None:
                 self._initialize_op()
         else:
-            if weight_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-                self.dispatch_dtype = DispatchDtype.fp8
             self.combine_dtype = (
                 CombineDtype.fp8
                 if weight_dtype == torch.float4_e2m1fn_x2
@@ -852,10 +934,17 @@ class _MoriEPDispatcherImplBase:
     def _apply_dispatch_dtype_override(self):
         """Apply dispatch and combine dtype overrides for the selected EP version."""
         dispatch_dtype = envs.SGLANG_MORI_DISPATCH_DTYPE.get().lower()
-        if self._is_epv2 and dispatch_dtype not in ("", "auto", "bf16", "fp4"):
+        if self._is_epv2 and dispatch_dtype not in (
+            "",
+            "auto",
+            "bf16",
+            "fp8",
+            "fp4",
+            "mxfp8",
+        ):
             raise ValueError(
-                "SGLANG_MORI_DISPATCH_DTYPE must be auto, bf16 or fp4 for EPv2; "
-                f"got {dispatch_dtype!r}"
+                "SGLANG_MORI_DISPATCH_DTYPE must be auto, bf16, fp8, fp4 or mxfp8 "
+                f"for EPv2; got {dispatch_dtype!r}"
             )
         if envs.SGLANG_MORI_DISPATCH_DTYPE.is_set():
             if dispatch_dtype != "auto":
@@ -880,27 +969,12 @@ class _MoriEPDispatcherImplBase:
                         )
 
         if self._is_epv2:
-            self.combine_dtype = CombineDtype.bf16
-            if "SGLANG_MORI_COMBINE_DTYPE" in os.environ:
-                combine_dtype = os.environ["SGLANG_MORI_COMBINE_DTYPE"].lower()
-                if combine_dtype in ("fp8", "fp8_direct_cast", "fp4"):
-                    logger.warning_once(
-                        f"SGLANG_MORI_COMBINE_DTYPE={combine_dtype} is not supported "
-                        "by the current SGLang MORI EPv2 adapter; falling back to bf16."
-                    )
-                elif combine_dtype not in ("", "auto", "bf16"):
-                    raise ValueError(
-                        "SGLANG_MORI_COMBINE_DTYPE must be auto, bf16, fp8, "
-                        f"fp8_direct_cast or fp4; got {combine_dtype!r}"
-                    )
-            elif "SGLANG_MORI_FP8_COMB" in os.environ:
-                logger.warning_once(
-                    "SGLANG_MORI_FP8_COMB is deprecated and ignored by the current "
-                    "SGLang MORI EPv2 adapter, which uses bf16 combine. "
-                    "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16 instead."
-                )
-            return
+            self._apply_epv2_combine_dtype_override()
+        else:
+            self._apply_epv1_combine_dtype_override()
+        self._fall_back_from_nan_direct_cast()
 
+    def _apply_epv1_combine_dtype_override(self):
         if "SGLANG_MORI_COMBINE_DTYPE" in os.environ:
             combine_dtype = os.environ["SGLANG_MORI_COMBINE_DTYPE"].lower()
             if combine_dtype != "auto":
@@ -912,6 +986,55 @@ class _MoriEPDispatcherImplBase:
                     self.combine_dtype = CombineDtype.fp8_direct_cast
                 elif combine_dtype == "fp4":
                     self.combine_dtype = CombineDtype.fp4
+
+    def _apply_epv2_combine_dtype_override(self):
+        self.combine_dtype = CombineDtype.bf16
+        if "SGLANG_MORI_COMBINE_DTYPE" in os.environ:
+            combine_dtype = os.environ["SGLANG_MORI_COMBINE_DTYPE"].lower()
+            if combine_dtype == "fp8":
+                self.combine_dtype = CombineDtype.fp8
+            elif combine_dtype == "fp8_direct_cast":
+                self.combine_dtype = CombineDtype.fp8_direct_cast
+            elif combine_dtype == "fp4":
+                logger.warning_once(
+                    "SGLANG_MORI_COMBINE_DTYPE=fp4 is not supported by MORI EPv2; "
+                    "falling back to bf16."
+                )
+            elif combine_dtype not in ("", "auto", "bf16"):
+                raise ValueError(
+                    "SGLANG_MORI_COMBINE_DTYPE must be auto, bf16, fp8, "
+                    f"fp8_direct_cast or fp4; got {combine_dtype!r}"
+                )
+        elif "SGLANG_MORI_FP8_COMB" in os.environ:
+            logger.warning_once(
+                "SGLANG_MORI_FP8_COMB is deprecated. "
+                "Use SGLANG_MORI_COMBINE_DTYPE=auto|bf16|fp8|fp8_direct_cast instead."
+            )
+            if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
+                self.combine_dtype = CombineDtype.fp8
+        if (
+            self.combine_dtype != CombineDtype.bf16
+            and self.dispatch_dtype != DispatchDtype.bf16
+        ):
+            # MORI EPv2 rejects a quantized combine on an asymmetric (quantized-dispatch) op.
+            logger.warning_once(
+                f"MORI EPv2 {self.combine_dtype} combine requires bf16 dispatch, "
+                f"got {self.dispatch_dtype}; falling back to bf16 combine."
+            )
+            self.combine_dtype = CombineDtype.bf16
+
+    def _fall_back_from_nan_direct_cast(self):
+        if (
+            self.combine_dtype == CombineDtype.fp8_direct_cast
+            and not _mori_fp8_direct_cast_saturates()
+        ):
+            logger.warning_once(
+                "This MORI build's fp8_direct_cast combine emits NaN instead of "
+                "saturating values past the fp8 max, which corrupts models with "
+                "large expert outputs such as DeepSeek-V4; falling back to fp8 "
+                "(blockwise) combine. Upgrade MORI to use fp8_direct_cast."
+            )
+            self.combine_dtype = CombineDtype.fp8
 
     def set_overlap_args(self, combine_overlap_args, meta_overlap_args):
         self.overlap_args = combine_overlap_args
@@ -1326,8 +1449,9 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
         os.environ.setdefault("AITER_FLYDSL_EP_NO_FAKE_EXPERT", "1")
         self.async_finish = async_finish
         tbo_enabled = self._tbo_enabled
-        # Disable direct output for TBO to preserve buffer/stream ownership.
-        self._direct_output = not tbo_enabled and get_bool_env_var(
+        # TBO children own separate arenas (instance_id); combine waits on the
+        # compute event recorded after the expert writes into its child's view.
+        self._direct_output = get_bool_env_var(
             "SGLANG_MORI_EPV2_AITER_DIRECT_OUTPUT", "true"
         )
         self._comm_stream = _get_tbo_comm_stream(
@@ -1349,9 +1473,13 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             ),
         )
         self._mori_op = None
+        self.fp8_quant_func = None
         self.fp4_quant_func = None
+        self.mxfp8_quant_func = None
         if _use_aiter:
+            self.fp8_quant_func = get_hip_quant(QuantType.per_1x128)
             self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
+            self.mxfp8_quant_func = get_hip_quant(QuantType.per_1x32)
 
     def _initialize_op(self):
         # set_quant_config runs during model loading, before CUDA graph capture,
@@ -1366,11 +1494,8 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             self.max_tokens_per_rank,
             self.instance_id,
             get_int_env_var("SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS", 0),
-            (
-                torch.float4_e2m1fn_x2
-                if self.dispatch_dtype == DispatchDtype.fp4
-                else torch.bfloat16
-            ),
+            self.dispatch_dtype,
+            self.combine_dtype,
             self._launch_config,
         )
         prepare_recv_cap = getattr(self._mori_op, "prepare_recv_cap", None)
@@ -1460,10 +1585,16 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPDispatcherImplBase):
             total_recv,
             routing,
         ) = result
-        if recv_scales is not None and self.dispatch_dtype == DispatchDtype.fp4:
-            recv_scales = recv_scales.view(torch.float8_e8m0fnu)[
-                :, : self.hidden_size // MXFP4_BLOCK_SIZE
-            ]
+        if recv_scales is not None:
+            # MORI forwards scales as opaque i32 dwords; restore the quantizer layout.
+            if self.dispatch_dtype == DispatchDtype.fp8:
+                recv_scales = recv_scales.view(torch.float32)[
+                    :, : self.hidden_size // FP8_BLOCK_SIZE
+                ]
+            else:
+                recv_scales = recv_scales.view(torch.float8_e8m0fnu)[
+                    :, : self.hidden_size // MXFP4_BLOCK_SIZE
+                ]
         self._routing = routing
         self._recv_topk_ids = recv_indices
         expert_output = None

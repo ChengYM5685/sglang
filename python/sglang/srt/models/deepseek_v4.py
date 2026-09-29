@@ -2602,7 +2602,7 @@ def _every_row_routed(forward_batch: ForwardBatch, num_rows: int):
 
 
 def _attn_tp_all_gather_chunks(
-    local: torch.Tensor, *, chunk_rows: List[int]
+    local: torch.Tensor, chunk_rows: List[int]
 ) -> torch.Tensor:
     # Tensor all_gather stays on aiter AG / pynccl under graph capture; the list
     # all_gather falls back to ProcessGroupNCCL, which invalidates HIP capture.
@@ -3772,7 +3772,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        *,
         input_ids: Optional[torch.Tensor],
         input_ids_global: Optional[torch.Tensor],
     ) -> torch.Tensor:
