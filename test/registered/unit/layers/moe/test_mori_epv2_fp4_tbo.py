@@ -1,10 +1,12 @@
 import logging
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call
 
 import pytest
 import torch
 
+import sglang.srt.arg_groups.moe_hook as moe_hook
 import sglang.srt.layers.moe.token_dispatcher.moriep as adapter
 from sglang.srt.layers.moe.token_dispatcher.moriep import (
     CombineDtype,
@@ -70,11 +72,20 @@ def test_quant_config_selects_fp4_asymmetric_transport(monkeypatch):
     dispatcher._initialize_op.assert_called_once_with()
 
 
-def test_quant_config_defaults_to_bf16(monkeypatch):
+# Same auto dispatch dtype as EPv1 for each weight dtype.
+@pytest.mark.parametrize(
+    "weight_dtype,expected",
+    [
+        (torch.bfloat16, DispatchDtype.bf16),
+        (torch.float8_e4m3fn, DispatchDtype.fp8),
+        (torch.float8_e4m3fnuz, DispatchDtype.fp8),
+    ],
+)
+def test_quant_config_default_dispatch_dtype(monkeypatch, weight_dtype, expected):
     monkeypatch.delenv("SGLANG_MORI_DISPATCH_DTYPE", raising=False)
     dispatcher = _dispatcher_for_quant_test()
-    dispatcher.set_quant_config({"weight_dtype": torch.bfloat16})
-    assert dispatcher.dispatch_dtype == DispatchDtype.bf16
+    dispatcher.set_quant_config({"weight_dtype": weight_dtype})
+    assert dispatcher.dispatch_dtype == expected
 
 
 def test_fp4_override_and_invalid_override(monkeypatch):
@@ -85,7 +96,7 @@ def test_fp4_override_and_invalid_override(monkeypatch):
 
     dispatcher = _dispatcher_for_quant_test()
     monkeypatch.setenv("SGLANG_MORI_DISPATCH_DTYPE", "invalid")
-    with pytest.raises(ValueError, match="must be auto, bf16 or fp4 for EPv2"):
+    with pytest.raises(ValueError, match="must be auto, bf16, fp8, fp4 or mxfp8"):
         dispatcher.set_quant_config({"weight_dtype": torch.bfloat16})
 
 
@@ -109,18 +120,69 @@ def test_supported_combine_dtype_is_quiet(
     assert not caplog.messages
 
 
-@pytest.mark.parametrize("value", ["fp8", "fp8_direct_cast", "fp4", "FP8"])
-def test_unsupported_combine_dtype_warns_once_and_falls_back(
-    monkeypatch, caplog, combine_dispatcher, value
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("fp8", CombineDtype.fp8),
+        ("FP8", CombineDtype.fp8),
+        ("fp8_direct_cast", CombineDtype.fp8_direct_cast),
+    ],
+)
+def test_quantized_combine_needs_bf16_dispatch(
+    monkeypatch, caplog, combine_dispatcher, value, expected
 ):
+    """MORI EPv2 rejects a quantized combine on a quantized-dispatch op."""
     monkeypatch.setenv("SGLANG_MORI_COMBINE_DTYPE", value)
+    combine_dispatcher.set_quant_config({"weight_dtype": torch.bfloat16})
+    assert combine_dispatcher.combine_dtype == expected
+    assert not caplog.messages
+
     for _ in range(2):
         combine_dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
     assert combine_dispatcher.combine_dtype == CombineDtype.bf16
     assert combine_dispatcher.dispatch_dtype == DispatchDtype.fp4
     assert len(caplog.messages) == 1
-    assert f"SGLANG_MORI_COMBINE_DTYPE={value.lower()}" in caplog.messages[0]
-    assert "falling back to bf16" in caplog.messages[0]
+    assert "requires bf16 dispatch" in caplog.messages[0]
+
+
+def test_fp4_combine_warns_once_and_falls_back(monkeypatch, caplog, combine_dispatcher):
+    monkeypatch.setenv("SGLANG_MORI_COMBINE_DTYPE", "fp4")
+    for _ in range(2):
+        combine_dispatcher.set_quant_config({"weight_dtype": torch.bfloat16})
+    assert combine_dispatcher.combine_dtype == CombineDtype.bf16
+    assert len(caplog.messages) == 1
+    assert "SGLANG_MORI_COMBINE_DTYPE=fp4" in caplog.messages[0]
+
+
+def _dsv4_fp8_combine_cfg():
+    # MORI cfg of DSv4-Pro TP8 EP8, bf16 dispatch, fp8_blockwise (scatter) combine.
+    return SimpleNamespace(
+        effective_max_recv=8 * 16384,
+        max_num_inp_token_per_rank=16384,
+        num_experts_per_token=7,
+        world_size=8,
+        hidden_dim=7168,
+        token_nbytes=7168 * 2,
+        combine_token_nbytes=7168 * 2,
+        scale_dim=0,
+        scale_type_size=0,
+        is_scatter=True,
+        wire_elem_size=1,
+        fp8_blockwise=True,
+        combine_scale_dim=7168 // 128,
+    )
+
+
+def test_epv2_vmm_budget_covers_scatter_combine_arena():
+    """A quantized combine adds a scatter staging arena that outgrew a fixed 4 GiB window."""
+    cfg = _dsv4_fp8_combine_cfg()
+    # 4.413 GiB measured from MORI's flydsl SymmArena layout for this cfg.
+    assert adapter._epv2_arena_bytes(cfg) >= int(4.413 * (1 << 30))
+    with adapter.envs.SGLANG_MORI_EPV2_PER_RANK_VMM_GB.override(None):
+        assert adapter._epv2_per_rank_vmm_gb(cfg) == 5
+    with adapter.envs.SGLANG_MORI_EPV2_PER_RANK_VMM_GB.override(4):
+        with pytest.raises(ValueError, match="SGLANG_MORI_EPV2_PER_RANK_VMM_GB=4"):
+            adapter._epv2_per_rank_vmm_gb(cfg)
 
 
 def test_invalid_combine_dtype_fails_before_initialization(
@@ -142,12 +204,14 @@ def test_combine_dtype_takes_precedence_over_legacy_flag(
     if current is not None:
         monkeypatch.setenv("SGLANG_MORI_COMBINE_DTYPE", current)
     combine_dispatcher.set_quant_config({"weight_dtype": torch.bfloat16})
-    assert combine_dispatcher.combine_dtype == CombineDtype.bf16
     if current is None:
+        assert combine_dispatcher.combine_dtype == (
+            CombineDtype.fp8 if legacy == "1" else CombineDtype.bf16
+        )
         assert len(caplog.messages) == 1
         assert "SGLANG_MORI_FP8_COMB is deprecated" in caplog.messages[0]
-        assert "uses bf16 combine" in caplog.messages[0]
     else:
+        assert combine_dispatcher.combine_dtype == CombineDtype.bf16
         assert not caplog.messages
 
 
@@ -235,7 +299,10 @@ def test_epv2_deduplicated_bound(
         ({"attn_dp_rank": 8}, "sender_mapping_unknown"),
         ({"attn_cp_size": 2}, "sender_mapping_unknown"),
         ({"attn_dp_size": 1, "attn_tp_size": 4}, "sender_mapping_unknown"),
-        ({"attn_dp_size": 1, "attn_tp_size": 8, "attn_tp_rank": 8}, "sender_mapping_unknown"),
+        (
+            {"attn_dp_size": 1, "attn_tp_size": 8, "attn_tp_rank": 8},
+            "sender_mapping_unknown",
+        ),
         ({"attn_dp_size": 1, "attn_tp_size": 8, "local_rows": -1}, "metadata_invalid"),
         (
             {"attn_dp_size": 1, "attn_tp_size": 8, "explicit_cluster_rows": 57},
@@ -290,9 +357,11 @@ def test_epv2_bound_sums_attention_tp_scattered_groups(
 ):
     attn_tp_size = 8 // attn_dp_size
     attn_dp_rank, attn_tp_rank = divmod(rank, attn_tp_size)
-    local_rows = torch.arange(group_rows[attn_dp_rank]).tensor_split(attn_tp_size)[
-        attn_tp_rank
-    ].numel()
+    local_rows = (
+        torch.arange(group_rows[attn_dp_rank])
+        .tensor_split(attn_tp_size)[attn_tp_rank]
+        .numel()
+    )
     decision = _mori_epv2_recv_bound_decision(
         enabled=True,
         physical_rows=65536,
@@ -313,7 +382,6 @@ def test_epv2_bound_sums_attention_tp_scattered_groups(
         is_internode=False,
     )
     assert (decision.rows, decision.reason) == (expected, "trimmed_dedup")
-
 
 
 @pytest.mark.parametrize("stale_sender_rows", [None, [1152], [8]])
@@ -441,6 +509,92 @@ def test_select_recv_cap_uses_current_nonuniform_sender_snapshot(monkeypatch):
         == 960
     )
     assert dispatcher._recv_bound_reason == "trimmed_dedup"
+
+
+_MORI_VERSION_ENVS = (
+    "SGLANG_MORI_EP_VERSION",
+    "SGLANG_MORI_DISPATCH_DTYPE",
+    "SGLANG_MORI_COMBINE_DTYPE",
+    "SGLANG_MORI_FP8_COMB",
+    "SGLANG_MORI_FP8_DISP",
+    "SGLANG_MORI_FP4_DISP",
+    "MORI_ENABLE_SDMA",
+)
+
+
+@pytest.fixture
+def epv2_capable_env(monkeypatch):
+    # setenv first so monkeypatch restores whatever a delenv removes.
+    for name in _MORI_VERSION_ENVS:
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("SGLANG_USE_AITER", "1")
+    monkeypatch.setattr(moe_hook, "_mori_epv2_installed", lambda: True)
+
+
+@pytest.mark.parametrize(
+    "explicit,reason,expected,env_after",
+    [
+        (None, None, "epv2", None),
+        # The fallback must reach the env: worker processes re-read it.
+        (None, "x", "epv1", "epv1"),
+        # An explicit epv2 is honored, never silently downgraded.
+        ("epv2", "x", "epv2", "epv2"),
+    ],
+)
+def test_mori_ep_version_prefers_epv2_and_falls_back(
+    monkeypatch, epv2_capable_env, explicit, reason, expected, env_after
+):
+    if explicit is not None:
+        monkeypatch.setenv("SGLANG_MORI_EP_VERSION", explicit)
+    monkeypatch.setattr(
+        moe_hook, "_mori_epv2_unsupported_reason", lambda server_args: reason
+    )
+    assert moe_hook._resolve_mori_ep_version(None) == expected
+    assert os.environ.get("SGLANG_MORI_EP_VERSION") == env_after
+
+
+@pytest.mark.parametrize(
+    "env,supported",
+    [
+        ({}, True),
+        # Auto dispatch is fp4 for fp4 weights, where EPv2 drops the fp8 combine.
+        ({"SGLANG_MORI_COMBINE_DTYPE": "fp8"}, False),
+        ({"SGLANG_MORI_FP8_COMB": "1"}, False),
+        (
+            {"SGLANG_MORI_COMBINE_DTYPE": "fp8", "SGLANG_MORI_DISPATCH_DTYPE": "bf16"},
+            True,
+        ),
+        ({"SGLANG_MORI_COMBINE_DTYPE": "fp4"}, False),
+        ({"SGLANG_MORI_FP4_DISP": "0"}, False),
+        ({"MORI_ENABLE_SDMA": "1"}, False),
+        ({"SGLANG_USE_AITER": "0"}, False),
+    ],
+)
+def test_mori_epv2_env_support(monkeypatch, epv2_capable_env, env, supported):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    reason = moe_hook._mori_epv2_config_unsupported_reason(ep_size=8)
+    assert (reason is None) == supported
+
+
+def test_mori_epv2_topology_support(epv2_capable_env):
+    assert moe_hook._mori_epv2_config_unsupported_reason(ep_size=8) is None
+    assert moe_hook._mori_epv2_config_unsupported_reason(ep_size=16) is not None
+
+
+def test_mori_epv2_unvalidated_model_only_warns(monkeypatch, caplog):
+    monkeypatch.setattr(moe_hook, "logger", logging.getLogger("mori_epv2_model"))
+    for architecture in ("DeepseekV4ForCausalLM", "DeepseekV3ForCausalLM"):
+        moe_hook._warn_if_mori_epv2_unvalidated_model(
+            hf_config=SimpleNamespace(architectures=[architecture])
+        )
+    assert len(caplog.messages) == 1
+    assert "DeepseekV3ForCausalLM" in caplog.messages[0]
+    assert (
+        moe_hook._mori_epv2_dtype_unsupported_reason(model_dtype=torch.bfloat16) is None
+    )
+    assert moe_hook._mori_epv2_dtype_unsupported_reason(model_dtype=torch.float16)
 
 
 if __name__ == "__main__":

@@ -17,14 +17,19 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 
 
-def _expert_output(dispatched, fp4_enabled: bool, fp4_lookup=None):
-    if not fp4_enabled:
+def _expert_output(dispatched, dispatch: str, fp4_lookup=None):
+    if dispatch == "bf16":
         return dispatched.hidden_states
 
-    packed = dispatched.hidden_states.view(torch.uint8)
-    nibbles = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)
-    values = fp4_lookup[nibbles.long()]
-    scales = dispatched.hidden_states_scale.repeat_interleave(32, dim=1).float()
+    if dispatch == "fp4":
+        packed = dispatched.hidden_states.view(torch.uint8)
+        nibbles = torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)
+        values = fp4_lookup[nibbles.long()]
+    else:
+        values = dispatched.hidden_states.float()
+    # fp8 uses fp32 scales per 128 columns; fp4 and mxfp8 use e8m0 per 32.
+    block = 128 if dispatch == "fp8" else 32
+    scales = dispatched.hidden_states_scale.float().repeat_interleave(block, dim=1)
     output = (values * scales[:, : values.shape[1]]).to(torch.bfloat16)
     valid_rows = (
         torch.arange(output.shape[0], device=output.device)
@@ -68,7 +73,14 @@ def main():
     experts_per_rank = int(os.environ.get("EPR", "48"))
     num_experts = world_size * experts_per_rank
     tokens = int(os.environ.get("TOKENS", "64"))
-    fp4_enabled = os.environ.get("FP4", "0") == "1"
+    # DISPATCH / COMBINE map to SGLANG_MORI_DISPATCH_DTYPE / SGLANG_MORI_COMBINE_DTYPE.
+    dispatch = os.environ.get(
+        "DISPATCH", "fp4" if os.environ.get("FP4", "0") == "1" else "bf16"
+    )
+    combine = os.environ.get("COMBINE", "bf16")
+    os.environ["SGLANG_MORI_DISPATCH_DTYPE"] = dispatch
+    os.environ["SGLANG_MORI_COMBINE_DTYPE"] = combine
+    fp4_enabled = dispatch == "fp4"
     fp4_lookup = (
         torch.tensor(
             [
@@ -171,6 +183,8 @@ def main():
 
     dispatched = dispatcher.dispatch(hidden, topk_output)
     impl = dispatcher._get_impl()
+    assert impl.dispatch_dtype.name == dispatch, (impl.dispatch_dtype, dispatch)
+    assert impl.combine_dtype.name == combine, (impl.combine_dtype, combine)
     expected_cap = 0
     if impl._trim_recv:
         cluster_rows = (
@@ -189,7 +203,7 @@ def main():
     assert expected_cap == 0 or recv_rows <= expected_cap, (recv_rows, expected_cap)
     combined = dispatcher.combine(
         (
-            _expert_output(dispatched, fp4_enabled, fp4_lookup),
+            _expert_output(dispatched, dispatch, fp4_lookup),
             dispatched.topk_ids,
             dispatched.topk_weights,
         )
@@ -200,7 +214,13 @@ def main():
     expected = (
         _expected_unique_destinations(topk_ids, experts_per_rank) * hidden.float().cpu()
     ).to(torch.bfloat16)
-    tolerance = 6e-1 if fp4_enabled else 2e-2
+    # Arbitrary bounds: fp4 keeps ~1 mantissa bit, e4m3 keeps 3 (per quantization hop).
+    if fp4_enabled:
+        tolerance = 6e-1
+    elif dispatch != "bf16" or combine != "bf16":
+        tolerance = 1.5e-1
+    else:
+        tolerance = 2e-2
     error = (combined.float().cpu() - expected.float()).abs()
     ok = torch.allclose(
         combined.float().cpu(), expected.float(), atol=tolerance, rtol=tolerance
@@ -216,7 +236,8 @@ def main():
             f"empty_last_rank={os.environ.get('EMPTY_LAST_RANK', '0')} "
             f"attn_tp={attn_tp_size} sender_rows={sender_rows} stale_rows={stale_rows} "
             f"recv_cap={dispatched.recv_cap}",
-            f"fp4={fp4_enabled}",
+            f"dispatch={dispatch} combine={combine} "
+            f"combine_mode={impl.mori_op.cfg.combine_mode}",
             f"mean_abs_error={error.mean().item():.6f}",
             f"max_abs_error={error.max().item() if error.numel() else 0:.6f}",
             flush=True,
@@ -229,7 +250,7 @@ def main():
             graph_dispatched = dispatcher.dispatch(hidden, topk_output)
             graph_combined = dispatcher.combine(
                 (
-                    _expert_output(graph_dispatched, fp4_enabled, fp4_lookup),
+                    _expert_output(graph_dispatched, dispatch, fp4_lookup),
                     graph_dispatched.topk_ids,
                     graph_dispatched.topk_weights,
                 )
@@ -252,7 +273,7 @@ def main():
         eager_dispatched = dispatcher.dispatch(hidden, topk_output)
         eager_after_graph = dispatcher.combine(
             (
-                _expert_output(eager_dispatched, fp4_enabled, fp4_lookup),
+                _expert_output(eager_dispatched, dispatch, fp4_lookup),
                 eager_dispatched.topk_ids,
                 eager_dispatched.topk_weights,
             )
