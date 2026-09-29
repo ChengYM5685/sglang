@@ -164,12 +164,14 @@ def test_recv_capacity_api_compatibility(monkeypatch, dynamic, comm_stream):
     monkeypatch.setattr(torch, "cuda", MagicMock())
     dispatcher = Mock()
     _MoriEPv2DispatcherImplNormal._initialize_op(dispatcher)
+    assert dispatcher._recv_cap_pow2_buckets is dynamic
     if dynamic:
         assert op.prepare_recv_cap.call_args_list == [call(32), call(64)]
     dispatcher.mori_op = op
     dispatcher._trim_recv = False
     dispatcher._direct_output = False
-    dispatcher._select_recv_cap.return_value = 32
+    dispatcher._recv_cap = 32
+    dispatcher._manual_recv_cap = 0
     dispatcher._comm_stream = Mock() if comm_stream else None
     _MoriEPv2DispatcherImplNormal.dispatch_b(dispatcher, *((None,) * 5 + (Mock(),)))
     kwargs = {"return_routing": True}
@@ -178,13 +180,38 @@ def test_recv_capacity_api_compatibility(monkeypatch, dynamic, comm_stream):
     op.dispatch.assert_called_once_with(None, None, None, None, **kwargs)
 
 
-@pytest.mark.parametrize("rows,expected", [(0, 32), (35, 64), (448, 512), (8192, 8192)])
-def test_optional_recv_bound_does_not_import_an_unavailable_dispatcher(rows, expected):
-    dispatcher = SimpleNamespace(
-        mori_op=SimpleNamespace(cfg=SimpleNamespace(effective_max_recv=65536)),
-        _trim_recv=True,
+@pytest.mark.parametrize(
+    "backend,expected",
+    [("mori", True), ("deepep", False), ("none", True), ("flashinfer", True)],
+)
+def test_epv2_dp_graph_sync_respects_explicit_backend(monkeypatch, backend, expected):
+    import sglang.srt.layers.moe.utils as moe_utils
+    import sglang.srt.utils.common as common
+
+    monkeypatch.setenv("SGLANG_MORI_EP_VERSION", "epv2")
+    monkeypatch.setenv("SGLANG_MORI_RECV_BOUND", "0")
+    monkeypatch.setattr(
+        moe_utils, "get_moe_a2a_backend", lambda: moe_utils.MoeA2ABackend.MORI
     )
-    assert _MoriEPv2DispatcherImplNormal._select_recv_cap(dispatcher, rows) == expected
+    monkeypatch.setattr(
+        common,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            enable_dp_attention=True,
+            enable_dp_lm_head=True,
+            dp_size=8,
+            tp_size=8,
+            moe_dense_tp_size=1,
+        ),
+    )
+    monkeypatch.setattr(
+        common,
+        "get_exec",
+        lambda: SimpleNamespace(moe=SimpleNamespace(elastic_ep_backend=None)),
+    )
+
+    assert common.require_mlp_tp_gather(moe_a2a_backend=backend) is expected
+    assert common.require_mlp_tp_gather() is True
 
 
 if __name__ == "__main__":
