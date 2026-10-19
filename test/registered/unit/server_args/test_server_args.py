@@ -1778,6 +1778,61 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             handle_a2a_moe(server_args)
 
 
+class TestMoriEpv2AsyncLLResolution(CustomTestCase):
+    """MORI EPv2 runs low_latency and SDMA on its AsyncLL kernels, so neither
+    is downgraded; a MORI build without them must still fall back to EPv1."""
+
+    def setUp(self):
+        self._env = patch.dict(os.environ)
+        self._env.start()
+        envs.SGLANG_USE_AITER.set(True)
+
+    def tearDown(self):
+        self._env.stop()
+
+    def _resolve(self, deepep_mode, async_ll, sdma=False):
+        import torch
+
+        # A fallback writes SGLANG_MORI_EP_V2=false, and an explicit value skips
+        # the checks, so start every resolution unset.
+        os.environ.pop("SGLANG_MORI_EP_V2", None)
+        os.environ["MORI_ENABLE_SDMA"] = "1" if sdma else "0"
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="mori",
+            deepep_mode=deepep_mode,
+            tp_size=8,
+            chunked_prefill_size=1024,
+        )
+        server_args._model_config = SimpleNamespace(
+            nvfp4_moe_meta=None,
+            dtype=torch.bfloat16,
+            hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.moe_hook._mori_has_epv2_async_ll",
+                return_value=async_ll,
+            ),
+            patch("sglang.srt.configs.model_config.is_deepseek_v4", return_value=True),
+        ):
+            handle_a2a_moe(server_args)
+        return envs.SGLANG_MORI_EP_V2.get(), resolution_result(
+            server_args, "deepep_mode"
+        )
+
+    def test_low_latency_keeps_epv2_with_async_ll(self):
+        self.assertEqual(self._resolve("low_latency", True), (True, "low_latency"))
+
+    def test_async_ll_modes_fall_back_without_async_ll(self):
+        self.assertEqual(self._resolve("low_latency", False), (False, "low_latency"))
+        self.assertEqual(self._resolve("normal", False, sdma=True), (False, "normal"))
+
+    def test_normal_needs_no_async_ll(self):
+        """The capability probe gates only the AsyncLL entries."""
+        self.assertEqual(self._resolve("normal", False), (True, "normal"))
+
+
 class TestFlashinferMegaMoeConfig(CustomTestCase):
     def setUp(self):
         self._combine_dtype_backup = os.environ.get(
