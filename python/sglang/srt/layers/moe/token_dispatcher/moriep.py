@@ -1528,8 +1528,7 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
         # SDMA / low_latency receive layout has not been checked against
         # mori_recv_bound.
         return (
-            not self._uses_async_ll
-            and not getattr(self.mori_op.cfg, "is_internode", True)
+            not getattr(self.mori_op.cfg, "is_internode", True)
             and getattr(self.mori_op, "backend_name", "unknown") in ("flydsl", "hip")
         )
 
