@@ -320,22 +320,52 @@ class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
         )
         self.assertEqual(self.log, ["dispatch", "combine"])
 
-    def test_recv_bound_only_skipped_for_micro_batches(self):
-        """The DP token counts behind mori_recv_bound describe the whole batch, so
-        only a micro-batch has to keep the full receive view."""
+    def test_recv_bound_applies_to_micro_batches(self):
         envs.SGLANG_MORI_RECV_BOUND.set(True)
         dispatcher = self._make_tbo_dispatcher()
         with (
-            patch.object(moriep, "mori_recv_bound", return_value=8),
+            patch.object(moriep, "mori_recv_bound", return_value=8) as bound,
             patch.object(moriep, "round_logical_recv_rows", return_value=16),
         ):
-            for active, expected in ((False, 16), (True, 0)):
+            for active in (False, True):
                 with self.subTest(tbo_subbatch_active=active):
                     dispatcher.tbo_subbatch_active = active
                     impl = dispatcher._get_impl()
                     impl._num_tokens = 3
                     impl._dispatch_sender_rows = (3, 3)
-                    self.assertEqual(impl._select_recv_cap(), expected)
+                    self.assertEqual(impl._select_recv_cap(), 16)
+                    bound.assert_called_with(3, (3, 3), micro_batch=active)
+
+    def test_micro_batch_bound_uses_whole_batch_rows(self):
+        """A micro-batch sees the whole batch's DP token counts; it sends a slice
+        of its rank's rows, so their sum still bounds what it receives."""
+        parallel = SimpleNamespace(
+            moe_ep_size=2,
+            tp_size=2,
+            attn_cp_size=1,
+            attn_dp_size=2,
+            attn_dp_rank=0,
+            attn_tp_size=1,
+            attn_tp_rank=0,
+        )
+        with patch.object(moriep, "get_parallel", return_value=parallel):
+            for local_rows, micro_batch, expected in (
+                (3, False, 8),
+                (2, False, 0),
+                (2, True, 8),
+                (0, True, 8),
+                (4, True, 0),
+            ):
+                with self.subTest(local_rows=local_rows, micro_batch=micro_batch):
+                    self.assertEqual(
+                        moriep.mori_recv_bound(
+                            local_rows, (3, 5), micro_batch=micro_batch
+                        ),
+                        expected,
+                    )
+            # Without DP attention there are no whole-batch counts to fall back on.
+            parallel.attn_dp_size = 1
+            self.assertEqual(moriep.mori_recv_bound(2, None, micro_batch=True), 0)
 
     def test_grid_cap_switch(self):
         capped = moriep._get_epv2_launch_config(True)

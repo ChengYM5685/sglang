@@ -70,12 +70,20 @@ def round_logical_recv_rows(cluster_rows: int, pow2_buckets: bool) -> int:
     return max(MORI_MIN_LOGICAL_RECV_ROWS, -(-cluster_rows // align) * align)
 
 
-def mori_recv_bound(local_rows: int, sender_rows: Optional[tuple[int, ...]]) -> int:
+def mori_recv_bound(
+    local_rows: int,
+    sender_rows: Optional[tuple[int, ...]],
+    micro_batch: bool = False,
+) -> int:
     """Return the unrounded receive-row bound, or 0 to keep the full view.
 
     Verified MORI kernels deduplicate rows per destination rank, so the bound
     comes from sender rows. The caller checks backend/TBO eligibility and
     applies rounding and the physical capacity.
+
+    A TBO micro-batch sees the whole batch's sender rows; each rank's
+    micro-batch is a slice of its rows, so their sum still bounds what it
+    receives.
     """
     parallel = get_parallel()
     ep_size = parallel.moe_ep_size
@@ -89,6 +97,8 @@ def mori_recv_bound(local_rows: int, sender_rows: Optional[tuple[int, ...]]) -> 
     attn_tp_rank = parallel.attn_tp_rank
 
     if attn_dp_size == 1:
+        if micro_batch:
+            return 0
         # Use the local tensor_split chunk: DSpark can leave DP token counts stale.
         return attn_tp_size * local_rows + attn_tp_rank
     if (
@@ -99,7 +109,9 @@ def mori_recv_bound(local_rows: int, sender_rows: Optional[tuple[int, ...]]) -> 
         return 0
     base, extra = divmod(sender_rows[attn_dp_rank], attn_tp_size)
     expected_local_rows = base + int(attn_tp_rank < extra)
-    if local_rows != expected_local_rows:
+    if local_rows > expected_local_rows or (
+        not micro_batch and local_rows != expected_local_rows
+    ):
         return 0
     return sum(sender_rows)
 
@@ -802,11 +814,13 @@ class _MoriEPDispatcherImplBase:
             self._recv_cap = min(self._manual_recv_cap, self._get_physical_recv_rows())
         elif (
             self._trim_recv
-            # The DP token counts describe the whole batch, not a micro-batch.
-            and not self._in_tbo_subbatch
             and self._is_recv_layout_verified()
         ):
-            bound = mori_recv_bound(self._num_tokens, self._dispatch_sender_rows)
+            bound = mori_recv_bound(
+                self._num_tokens,
+                self._dispatch_sender_rows,
+                micro_batch=self._in_tbo_subbatch,
+            )
             # Empty or unproved bounds keep the full view.
             if bound > 0:
                 cap = round_logical_recv_rows(
