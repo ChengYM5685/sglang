@@ -270,5 +270,82 @@ class TestMoriEPv2OpConfig(_MoriEPv2TestCase):
                 )
 
 
+class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
+    """--enable-two-batch-overlap must only change the calls that belong to a TBO
+    micro-batch; decode, verify and unsplit prefill forwards of the same server
+    keep the ordinary transfer settings."""
+
+    def _make_tbo_dispatcher(self):
+        stream = object()
+        with (
+            get_flags().moe.override(tbo_enabled=True),
+            patch.object(
+                moriep.CommStreamPool, "get_stream_from_pool", return_value=stream
+            ),
+        ):
+            dispatcher = self._make_dispatcher(DeepEPMode.NORMAL, async_finish=True)
+        self.assertIs(dispatcher._get_impl()._comm_stream, stream)
+        return dispatcher
+
+    def test_maybe_tbo_dispatcher_marks_micro_batch_calls(self):
+        from sglang.srt.batch_overlap.two_batch_overlap import (
+            MaybeTboDeepEPDispatcher,
+        )
+
+        inners = [SimpleNamespace(dispatch_a=lambda **kw: kw) for _ in range(2)]
+        wrapper = MaybeTboDeepEPDispatcher.__new__(MaybeTboDeepEPDispatcher)
+        wrapper._inners = inners
+        self.assertEqual(wrapper.dispatch_a(tbo_subbatch_index=1, x=1), {"x": 1})
+        self.assertTrue(inners[1].tbo_subbatch_active)
+        wrapper.dispatch_a(tbo_subbatch_index=0)
+        self.assertTrue(inners[0].tbo_subbatch_active)
+        wrapper.dispatch_a()
+        self.assertFalse(inners[0].tbo_subbatch_active)
+
+    def test_comm_stream_only_for_micro_batches(self):
+        dispatcher = self._make_tbo_dispatcher()
+        dispatcher.tbo_subbatch_active = True
+        self.assertTrue(dispatcher._get_impl()._use_comm_stream())
+
+        # An ordinary forward runs the transfer on the compute stream: no event,
+        # no comm-stream hop.
+        dispatcher.tbo_subbatch_active = False
+        impl = dispatcher._get_impl()
+        self.assertFalse(impl._use_comm_stream())
+        self.assertIsNone(impl._capture_event_if_async())
+        hidden, topk_output = self._inputs()
+        dispatched = dispatcher.dispatch(hidden, topk_output)
+        dispatcher.combine(
+            (dispatched.hidden_states, dispatched.topk_ids, dispatched.topk_weights)
+        )
+        self.assertEqual(self.log, ["dispatch", "combine"])
+
+    def test_recv_bound_only_skipped_for_micro_batches(self):
+        """The DP token counts behind mori_recv_bound describe the whole batch, so
+        only a micro-batch has to keep the full receive view."""
+        envs.SGLANG_MORI_RECV_BOUND.set(True)
+        dispatcher = self._make_tbo_dispatcher()
+        with (
+            patch.object(moriep, "mori_recv_bound", return_value=8),
+            patch.object(moriep, "round_logical_recv_rows", return_value=16),
+        ):
+            for active, expected in ((False, 16), (True, 0)):
+                with self.subTest(tbo_subbatch_active=active):
+                    dispatcher.tbo_subbatch_active = active
+                    impl = dispatcher._get_impl()
+                    impl._num_tokens = 3
+                    impl._dispatch_sender_rows = (3, 3)
+                    self.assertEqual(impl._select_recv_cap(), expected)
+
+    def test_grid_cap_switch(self):
+        capped = moriep._get_epv2_launch_config(True)
+        self.assertEqual(capped.dispatch_block_num, 32)
+        self.assertEqual(capped.combine_block_num, 48)
+        envs.SGLANG_MORI_EPV2_TBO_GRID_CAP.set(False)
+        self.assertEqual(
+            moriep._get_epv2_launch_config(True), moriep._get_epv2_launch_config(False)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
