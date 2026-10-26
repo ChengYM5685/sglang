@@ -3535,11 +3535,6 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         hidden_states = residual_batch.read_output(
             hidden_states, batch, hc_boundary.FinalRead(), None
         )
-        # DSpark aux hidden states: this ubatch's share of a captured layer's
-        # completed output; _forward_layers_tbo merges the two shares.
-        dspark_capture = getattr(batch, "dspark_capture", None)
-        if dspark_capture is not None and self.layer_id in dspark_capture[0]:
-            dspark_capture[1].append(hidden_states.mean(dim=1))
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
@@ -4325,7 +4320,9 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
 
-        run_tbo = self._can_run_tbo(forward_batch)
+        # DSpark's aux capture under TBO is validated on ROCm only; elsewhere a
+        # DSpark target keeps TBO off, as before.
+        run_tbo = self._can_run_tbo(forward_batch) and (not capture_dspark or _is_hip)
 
         if _is_npu and not run_tbo:
             # Rope cos/sin for the whole forward: one bf16 gather per rope
