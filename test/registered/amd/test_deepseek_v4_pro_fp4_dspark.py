@@ -36,7 +36,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro-dspark", nightly=True
+    est_time=10800, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro-dspark", nightly=True
 )
 
 DEEPSEEK_V4_DSPARK_MODEL_PATH = os.environ.get(
@@ -64,6 +64,26 @@ DSPARK_ENV_VARS = {
 FP4_ENV_VARS = {
     "SGLANG_DSV4_FP4_EXPERTS": "true",
 }
+
+# DSpark with prefill two-batch overlap over MORI EPv2. MoE communication belongs
+# to MORI, so the DP gatherv / reduce-scatter path stays off.
+MORI_EPV2_TBO_ENV_VARS = {
+    "SGLANG_MORI_EP_V2": "true",
+    "MORI_SHMEM_MODE": "ISOLATION",
+    "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "16384",
+    "SGLANG_MORI_RECV_BOUND": "1",
+    "SGLANG_MORI_TBO_RECV_BOUND": "1",
+    "SGLANG_TBO_MIN_EXTEND_TOKENS": "4096",
+    "SGLANG_DP_USE_GATHERV": "0",
+    "SGLANG_DP_USE_REDUCE_SCATTER": "0",
+}
+MORI_EPV2_TBO_ARGS = [
+    "--ep-size",
+    "8",
+    "--moe-a2a-backend",
+    "mori",
+    "--enable-two-batch-overlap",
+]
 
 
 class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
@@ -175,6 +195,10 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
 
 
 class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
+    extra_args: list = []
+    extra_env: dict = {}
+    summary_title = "deepseek-v4-pro-dspark unified_kv static MI35x"
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEEPSEEK_V4_DSPARK_MODEL_PATH
@@ -183,6 +207,7 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
         env.update(COMMON_ENV_VARS)
         env.update(DSPARK_ENV_VARS)
         env.update(FP4_ENV_VARS)
+        env.update(cls.extra_env)
         other_args = [
             "--trust-remote-code",
             "--tp",
@@ -217,6 +242,7 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
             "DSPARK",
             "--speculative-dspark-block-size",
             "5",
+            *cls.extra_args,
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -253,12 +279,34 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                "### test_gsm8k (deepseek-v4-pro-dspark unified_kv static MI35x)\n"
+                f"### test_gsm8k ({self.summary_title})\n"
                 f"accuracy={metrics['accuracy']:.3f}\n"
                 f"avg_spec_accept_length={avg_spec_accept_length:.2f}\n"
             )
         self.assertGreater(metrics["accuracy"], GSM8K_ACCURACY_THRESHOLD)
         self.assertGreater(avg_spec_accept_length, AVG_SPEC_ACCEPT_LENGTH_THRESHOLD)
+
+
+class TestDeepseekV4DSparkTboMoriEPv2GSM8K(TestDeepseekV4DSparkUnifiedKVGSM8K):
+    """DSpark target with prefill TBO over native MORI EPv2 (deepep normal)."""
+
+    extra_args = [*MORI_EPV2_TBO_ARGS, "--deepep-mode", "normal"]
+    extra_env = MORI_EPV2_TBO_ENV_VARS
+    summary_title = "deepseek-v4-pro-dspark TBO MORI EPv2 MI35x"
+
+
+class TestDeepseekV4DSparkTboMoriAsyncLLGSM8K(TestDeepseekV4DSparkUnifiedKVGSM8K):
+    """DSpark target with prefill TBO over MORI EPv2 AsyncLL (SDMA, early notify).
+    The dispatch dtype stays auto, which resolves to MXFP8 on gfx95x."""
+
+    extra_args = [*MORI_EPV2_TBO_ARGS, "--deepep-mode", "low_latency"]
+    extra_env = {
+        **MORI_EPV2_TBO_ENV_VARS,
+        "MORI_ENABLE_SDMA": "1",
+        "MORI_ASYNCLL_EARLY_NOTIFY": "1",
+        "SGLANG_MORI_ASYNCLL_RECV_BOUND": "1",
+    }
+    summary_title = "deepseek-v4-pro-dspark TBO MORI AsyncLL MI35x"
 
 
 if __name__ == "__main__":
