@@ -141,6 +141,36 @@ def _record_local_expert_count(local_expert_count: torch.Tensor) -> None:
 
 
 @functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=1)
+def _mori_asyncll_supports_fp4_dispatch() -> bool:
+    """Whether this MORI's AsyncLL kernels accept an fp4 dispatch leg.
+
+    Asks the hip backend's own gate with a minimal config instead of pinning a
+    MORI version; anything unexpected means no.
+    """
+    try:
+        from types import SimpleNamespace
+
+        from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+
+        cfg = SimpleNamespace(
+            dispatch_dtype=torch.float4_e2m1fn_x2,
+            combine_dtype=torch.bfloat16,
+            is_fp4=True,
+            is_scatter=False,
+            enable_std_moe=False,
+            quant_type="none",
+            async_ll_transport="sdma",
+            nodes=1,
+            gpu_per_node=8,
+            world_size=8,
+        )
+        bad = EpDispatchCombineOpHip._asyncll_unsupported(EpDispatchCombineOpHip, cfg)
+    except Exception:
+        return False
+    return not any(reason.startswith("dispatch dtype") for reason in bad)
+
+
 def _aiter_supports_mxfp8_dispatch() -> bool:
     """Whether this aiter can consume fp8 activations with group-32 e8m0 scales.
 
@@ -1468,7 +1498,10 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
     def _restrict_transport_dtypes(self) -> None:
         # The SDMA / low_latency kernels move bf16 or fp8 tokens and combine
         # unquantized.
-        if self.dispatch_dtype == DispatchDtype.fp4:
+        if (
+            self.dispatch_dtype == DispatchDtype.fp4
+            and not _mori_asyncll_supports_fp4_dispatch()
+        ):
             logger.warning_once(
                 "MORI EPv2 SDMA / low_latency transport has no fp4 dispatch; "
                 "falling back to bf16 dispatch."
