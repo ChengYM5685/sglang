@@ -14,7 +14,11 @@ from typing import (
     Union,
 )
 
-from sglang.srt.layers.dp_attention import set_dp_buffer_len
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    set_dp_buffer_len,
+    set_tbo_parent_dp_global_num_tokens,
+)
 from sglang.srt.model_executor.forward_context import (
     forward_context,
     get_forward_context,
@@ -57,15 +61,21 @@ def execute_overlapped_operations(
     executor_a = _StageExecutor("a", stages_a, inputs=inputs_a, child_ctx=child_ctx_a)
     executor_b = _StageExecutor("b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b)
 
-    for _ in range(delta_stage):
-        executor_a.next()
+    # The parent's per-rank counts are still published here; the executors
+    # overwrite them with the children's (None) on every stage.
+    set_tbo_parent_dp_global_num_tokens(get_dp_global_num_tokens())
+    try:
+        for _ in range(delta_stage):
+            executor_a.next()
 
-    for _ in range(executor_a.num_stages - delta_stage):
-        executor_a.next()
-        executor_b.next()
+        for _ in range(executor_a.num_stages - delta_stage):
+            executor_a.next()
+            executor_b.next()
 
-    for _ in range(delta_stage):
-        executor_b.next()
+        for _ in range(delta_stage):
+            executor_b.next()
+    finally:
+        set_tbo_parent_dp_global_num_tokens(None)
 
     assert executor_a.done and executor_b.done
     return [executor_a.output, executor_b.output]

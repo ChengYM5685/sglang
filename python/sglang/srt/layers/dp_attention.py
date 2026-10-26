@@ -377,6 +377,22 @@ def get_dp_global_num_tokens() -> List[int]:
     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
 
 
+# The per-rank token counts of the batch a TBO forward split, kept for the
+# duration of the overlapped execution: the children publish no list of their
+# own, but each child is at most its parent's share, so consumers that need an
+# upper bound (MoRI's MoE receive bound) can still use these.
+_tbo_parent_dp_global_num_tokens: Optional[List[int]] = None
+
+
+def set_tbo_parent_dp_global_num_tokens(rows: Optional[List[int]]) -> None:
+    global _tbo_parent_dp_global_num_tokens
+    _tbo_parent_dp_global_num_tokens = rows
+
+
+def get_tbo_parent_dp_global_num_tokens() -> Optional[List[int]]:
+    return _tbo_parent_dp_global_num_tokens
+
+
 def get_dp_hidden_size() -> int:
     return _DpGatheredBufferWrapper.get_dp_hidden_size()
 

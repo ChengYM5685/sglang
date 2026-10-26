@@ -901,6 +901,11 @@ class Envs:
     # Native EPv2 with TBO caps the dispatch/combine grid to leave CUs to the sibling
     # micro-batch; false keeps MORI's own launch geometry.
     SGLANG_MORI_EPV2_TBO_GRID_CAP = EnvBool(True)
+    # With SGLANG_MORI_RECV_BOUND, also bound a TBO micro-batch's MoE input by the
+    # whole batch's DP rows (every rank's micro-batch is at most its full share).
+    SGLANG_MORI_TBO_RECV_BOUND = EnvBool(False)
+    # Apply SGLANG_MORI_RECV_BOUND to MORI EPv2 AsyncLL (low_latency / SDMA) too.
+    SGLANG_MORI_ASYNCLL_RECV_BOUND = EnvBool(False)
 
     # ===================================================================
     # AMD, ROCm, and AITER
