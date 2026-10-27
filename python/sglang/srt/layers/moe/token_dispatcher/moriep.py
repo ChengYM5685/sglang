@@ -123,12 +123,33 @@ def mori_recv_bound(
 # logical receive cap compares with the rows actually received. Reading the count
 # syncs the stream, so never enable this for performance runs.
 _RECV_CAP_STATS_EVERY = int(os.environ.get("SGLANG_MORI_RECV_CAP_STATS", "0"))
+# Experimental: in prefill, read the received row count back (one sync per MoE
+# layer) and cap the MoE input at exactly that many rows.
+_RECV_CAP_EXACT = os.environ.get("SGLANG_MORI_RECV_CAP_EXACT", "0") == "1"
 _recv_cap_stats: dict = {}
 
 
-def _record_recv_cap_stats(cap: int, total_recv, physical: int, subbatch: bool):
+def _record_recv_cap_stats(
+    cap: int, total_recv, physical: int, subbatch: bool, local_rows=None, sender_rows=None
+):
+    torch.cuda.synchronize()
     received = int(total_recv.reshape(-1)[0].item()) if total_recv is not None else -1
     used = cap if cap > 0 else physical
+    if received > used:
+        from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+
+        logger.warning(
+            "MORI recv cap exceeded: received %d > cap %d (physical %d), subbatch=%s, "
+            "local_rows=%s, sender_rows=%s, dp_global_num_tokens=%s, total_recv=%s",
+            received,
+            used,
+            physical,
+            subbatch,
+            local_rows,
+            sender_rows,
+            get_dp_global_num_tokens(),
+            total_recv.reshape(-1)[:4].tolist(),
+        )
     s = _recv_cap_stats.setdefault(
         subbatch, {"n": 0, "recv": 0, "cap": 0, "uncapped": 0, "over": 0}
     )
@@ -1661,12 +1682,29 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
                 ]
         self._routing = routing
         self._recv_topk_ids = recv_indices
+        if (
+            _RECV_CAP_EXACT
+            and get_is_extend_in_batch()
+            and total_recv is not None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # Prefill runs eagerly, so the received row count can be read back:
+            # the MoE (and its fp4 upscale) then covers exactly the received rows
+            # instead of the sender-row bound. Costs one stream sync per MoE layer.
+            exact = round_logical_recv_rows(
+                int(total_recv.reshape(-1)[0].item()), pow2_buckets=False
+            )
+            physical = recv_hidden.shape[0]
+            if exact < (self._recv_cap if self._recv_cap > 0 else physical):
+                self._recv_cap = exact
         if _RECV_CAP_STATS_EVERY > 0:
             _record_recv_cap_stats(
                 self._recv_cap,
                 total_recv,
                 recv_hidden.shape[0],
                 self._in_tbo_subbatch,
+                self._num_tokens,
+                self._dispatch_sender_rows,
             )
         # Count after dispatch and before combine (combine resets total_recv), on
         # the compute stream that already waited for the dispatch.
