@@ -58,12 +58,16 @@ def execute_overlapped_operations(
 
     stages_a = _convert_operations_to_stages(operations_a)
     stages_b = _convert_operations_to_stages(operations_b)
-    executor_a = _StageExecutor("a", stages_a, inputs=inputs_a, child_ctx=child_ctx_a)
-    executor_b = _StageExecutor("b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b)
-
     # The parent's per-rank counts are still published here; the executors
     # overwrite them with the children's (None) on every stage.
-    set_tbo_parent_dp_global_num_tokens(get_dp_global_num_tokens())
+    parent_rows = get_dp_global_num_tokens()
+    executor_a = _StageExecutor(
+        "a", stages_a, inputs=inputs_a, child_ctx=child_ctx_a, parent_rows=parent_rows
+    )
+    executor_b = _StageExecutor(
+        "b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b, parent_rows=parent_rows
+    )
+    set_tbo_parent_dp_global_num_tokens(parent_rows)
     try:
         for _ in range(delta_stage):
             executor_a.next()
@@ -121,6 +125,7 @@ class _StageExecutor:
         stages: List[Stage],
         inputs: dict,
         child_ctx: Optional[ForwardContext] = None,
+        parent_rows: Optional[List[int]] = None,
     ):
         self._debug_name = debug_name
         self._stages = stages
@@ -139,6 +144,13 @@ class _StageExecutor:
         self._local_dp_buffer_len = forward_batch.tbo_padded_len
         self._global_num_tokens = forward_batch.global_num_tokens_cpu
         self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
+        # Per-rank rows that bound this micro-batch's MoE dispatch: its own when
+        # the DP gather carried the TBO split, else the parent's.
+        self._dispatch_bound_rows = (
+            forward_batch.tbo_child_global_num_tokens_cpu
+            if forward_batch.tbo_child_global_num_tokens_cpu is not None
+            else parent_rows
+        )
 
     def next(self):
         assert not self.done
@@ -154,6 +166,7 @@ class _StageExecutor:
             self._is_dp_max_padding,
             self._global_num_tokens,
         )
+        set_tbo_parent_dp_global_num_tokens(self._dispatch_bound_rows)
 
         ctx_mgr = (
             forward_context(self._child_ctx)

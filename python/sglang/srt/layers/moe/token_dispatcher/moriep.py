@@ -119,6 +119,38 @@ def mori_recv_bound(
     return sum(sender_rows)
 
 
+# Debug only: every N dispatches per (micro-batch / whole batch) kind, log how the
+# logical receive cap compares with the rows actually received. Reading the count
+# syncs the stream, so never enable this for performance runs.
+_RECV_CAP_STATS_EVERY = int(os.environ.get("SGLANG_MORI_RECV_CAP_STATS", "0"))
+_recv_cap_stats: dict = {}
+
+
+def _record_recv_cap_stats(cap: int, total_recv, physical: int, subbatch: bool):
+    received = int(total_recv.reshape(-1)[0].item()) if total_recv is not None else -1
+    used = cap if cap > 0 else physical
+    s = _recv_cap_stats.setdefault(
+        subbatch, {"n": 0, "recv": 0, "cap": 0, "uncapped": 0, "over": 0}
+    )
+    s["n"] += 1
+    s["recv"] += received
+    s["cap"] += used
+    s["uncapped"] += int(cap <= 0)
+    s["over"] += int(received > used)
+    if s["n"] % _RECV_CAP_STATS_EVERY == 0:
+        logger.info(
+            "MORI recv cap stats (%s): %d dispatches, mean received %.0f, mean cap %.0f, "
+            "cap/received %.2f, uncapped %d, received>cap %d",
+            "micro-batch" if subbatch else "whole batch",
+            s["n"],
+            s["recv"] / s["n"],
+            s["cap"] / s["n"],
+            s["cap"] / max(1, s["recv"]),
+            s["uncapped"],
+            s["over"],
+        )
+
+
 def _should_record_expert_distribution() -> bool:
     recorder = get_global_expert_distribution_recorder()
     if recorder.recording:
@@ -1629,6 +1661,13 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
                 ]
         self._routing = routing
         self._recv_topk_ids = recv_indices
+        if _RECV_CAP_STATS_EVERY > 0:
+            _record_recv_cap_stats(
+                self._recv_cap,
+                total_recv,
+                recv_hidden.shape[0],
+                self._in_tbo_subbatch,
+            )
         # Count after dispatch and before combine (combine resets total_recv), on
         # the compute stream that already waited for the dispatch.
         if _should_record_expert_distribution():

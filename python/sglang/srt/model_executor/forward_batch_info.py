@@ -762,6 +762,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For two-batch overlap
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    # A child's own per-rank rows (from the gathered split); None if unknown.
+    tbo_child_global_num_tokens_cpu: Optional[List[int]] = None
+    # Every DP rank's first-micro-batch rows, gathered with the TBO decision.
+    tbo_global_split_num_tokens: Optional[List[int]] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
@@ -1070,6 +1074,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            tbo_global_split_num_tokens=batch.tbo_global_split_num_tokens,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,

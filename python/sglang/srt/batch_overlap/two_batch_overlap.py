@@ -429,6 +429,9 @@ class TboDPAttentionPreparer:
         # this preparer unconditionally for the forward_mode all-gather, but
         # compute_split_seq_index is TBO-only and undefined for some modes
         # (e.g. MIXED from enable_mixed_chunk).
+        # Rows of this rank's first micro-batch, gathered so each micro-batch's
+        # dispatch can be bounded by its own per-rank rows.
+        self.local_tbo_split_num_tokens = 0
         if not enable_two_batch_overlap:
             self.local_tbo_split_seq_index = None
             return False, self._compute_local_forward_mode(local_batch)
@@ -472,6 +475,13 @@ class TboDPAttentionPreparer:
                 # Halving a short prefill doubles its kernel launches and buys no
                 # overlap; one such rank keeps the whole step unsplit.
                 local_can_run_tbo = False
+            if local_can_run_tbo and not local_batch.forward_mode.is_prebuilt():
+                self.local_tbo_split_num_tokens = compute_split_token_index(
+                    split_seq_index=self.local_tbo_split_seq_index,
+                    forward_mode=local_batch.forward_mode,
+                    extend_seq_lens=local_batch.extend_lens,
+                    token_num_per_seq=token_num_per_seq,
+                )
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True
@@ -693,6 +703,26 @@ class TboForwardBatchPreparer:
             child_b.extend_num_tokens,
         )
 
+    @staticmethod
+    def _child_global_num_tokens(
+        parent_rows: Optional[List[int]],
+        split_rows: Optional[List[int]],
+        first_child: bool,
+    ) -> Optional[List[int]]:
+        """Per-rank rows of one micro-batch: the first takes each rank's split
+        rows, the second the rest of that rank's parent rows. None when either
+        list is missing or their lengths differ."""
+        if (
+            parent_rows is None
+            or split_rows is None
+            or len(parent_rows) != len(split_rows)
+        ):
+            return None
+        first = [min(max(s, 0), p) for s, p in zip(split_rows, parent_rows)]
+        if first_child:
+            return first
+        return [p - f for p, f in zip(parent_rows, first)]
+
     @classmethod
     def filter_batch(
         cls,
@@ -833,6 +863,11 @@ class TboForwardBatchPreparer:
         extend_num_tokens = _compute_extend_num_tokens(
             output_dict["input_ids"], output_dict["forward_mode"]
         )
+        parent_global_num_tokens = (
+            batch.global_num_tokens_padded_cpu
+            if batch.global_num_tokens_padded_cpu is not None
+            else batch.global_num_tokens_cpu
+        )
 
         # TODO improve, e.g. unify w/ `init_raw`
         if (
@@ -863,6 +898,12 @@ class TboForwardBatchPreparer:
                 encoder_swa_replay=batch.encoder_swa_replay,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
+                tbo_child_global_num_tokens_cpu=cls._child_global_num_tokens(
+                    parent_global_num_tokens,
+                    batch.tbo_global_split_num_tokens,
+                    first_child=start_token_index == 0,
+                ),
+                tbo_global_split_num_tokens=None,
                 tbo_children=None,
                 original_global_num_tokens_cpu=None,
                 _original_batch_size=None,
