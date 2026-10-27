@@ -14,6 +14,7 @@ from typing import (
     Union,
 )
 
+from sglang.srt.batch_overlap.recv_cap_mode import use_child_rows
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     set_dp_buffer_len,
@@ -146,6 +147,7 @@ class _StageExecutor:
         self._is_dp_max_padding = forward_batch.dp_padding_mode.is_max_len()
         # Per-rank rows that bound this micro-batch's MoE dispatch: its own when
         # the DP gather carried the TBO split, else the parent's.
+        self._parent_rows = parent_rows
         self._dispatch_bound_rows = (
             forward_batch.tbo_child_global_num_tokens_cpu
             if forward_batch.tbo_child_global_num_tokens_cpu is not None
@@ -166,7 +168,9 @@ class _StageExecutor:
             self._is_dp_max_padding,
             self._global_num_tokens,
         )
-        set_tbo_parent_dp_global_num_tokens(self._dispatch_bound_rows)
+        set_tbo_parent_dp_global_num_tokens(
+            self._dispatch_bound_rows if use_child_rows() else self._parent_rows
+        )
 
         ctx_mgr = (
             forward_context(self._child_ctx)

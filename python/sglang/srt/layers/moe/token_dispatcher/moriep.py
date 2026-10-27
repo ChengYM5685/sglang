@@ -12,6 +12,7 @@ from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.batch_overlap.recv_cap_mode import use_exact_cap
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -1683,7 +1684,7 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
         self._routing = routing
         self._recv_topk_ids = recv_indices
         if (
-            _RECV_CAP_EXACT
+            (_RECV_CAP_EXACT or use_exact_cap())
             and get_is_extend_in_batch()
             and total_recv is not None
             and not torch.cuda.is_current_stream_capturing()
