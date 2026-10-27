@@ -281,6 +281,26 @@ class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
         )
         self.assertEqual(self.log, ["dispatch", "combine"])
 
+    def test_normal_sdma_under_sbo_receives_in_b(self):
+        """SBO runs the shared experts in the dispatch hook, between dispatch_a and
+        dispatch_b, so normal + SDMA must leave the receive to dispatch_b for them
+        to overlap the transfer. TBO keeps its micro-batches back to back."""
+        os.environ["MORI_ENABLE_SDMA"] = "1"
+        for tbo, expected in (
+            (False, ["dispatch_send", "shared", "dispatch_recv"]),
+            (True, ["dispatch_send", "dispatch_recv", "shared"]),
+        ):
+            with self.subTest(tbo=tbo):
+                del self.log[:]
+                with get_flags().moe.override(sbo_enabled=True, tbo_enabled=tbo):
+                    dispatcher = self._make_dispatcher(DeepEPMode.NORMAL)
+                hidden, topk_output = self._inputs()
+
+                dispatcher.dispatch_a(hidden, topk_output)
+                self.log.append("shared")
+                dispatcher.dispatch_b()
+                self.assertEqual(self.log, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
