@@ -140,6 +140,17 @@ def _record_local_expert_count(local_expert_count: torch.Tensor) -> None:
 
 
 @functools.lru_cache(maxsize=1)
+def _mori_async_ll_supports_fp4_dispatch() -> bool:
+    # MORI builds whose AsyncLL dispatch moves fp4x2 list it in this table.
+    try:
+        from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+    except ImportError:
+        return False
+    table = vars(EpDispatchCombineOpHip).get("_ASYNCLL_DISPATCH_DTYPE", {})
+    return torch.float4_e2m1fn_x2 in table
+
+
+@functools.lru_cache(maxsize=1)
 def _aiter_supports_mxfp8_dispatch() -> bool:
     """Whether this aiter can consume fp8 activations with group-32 e8m0 scales.
 
@@ -1467,11 +1478,14 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
         return CombineDtype.bf16
 
     def _restrict_transport_dtypes(self) -> None:
-        # The SDMA / low_latency kernels move bf16 or fp8 tokens and combine
-        # unquantized. In place of fp4, MXFP8 keeps the MoE's group-32 e8m0
-        # layout and moves half of bf16's bytes. gfx1250's a8w4 MoE quantizes its
-        # bf16 input itself and takes no pre-quantized activation, so stay bf16.
-        if self.dispatch_dtype == DispatchDtype.fp4:
+        # The SDMA / low_latency kernels combine unquantized, and older MORI builds
+        # move only bf16 or fp8 tokens. In place of fp4, MXFP8 keeps the MoE's
+        # group-32 e8m0 layout and moves half of bf16's bytes. gfx1250's a8w4 MoE
+        # quantizes its bf16 input itself and takes no pre-quantized fp8, so stay bf16.
+        if (
+            self.dispatch_dtype == DispatchDtype.fp4
+            and not _mori_async_ll_supports_fp4_dispatch()
+        ):
             fp4_weights = (
                 self.quant_config is not None
                 and self.quant_config.get("weight_dtype") == torch.float4_e2m1fn_x2

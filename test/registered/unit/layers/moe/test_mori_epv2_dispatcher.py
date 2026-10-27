@@ -205,12 +205,28 @@ class TestMoriEPv2Transport(_MoriEPv2TestCase):
                 impl.dispatch_dtype = moriep.DispatchDtype.fp4
                 with (
                     patch.object(
+                        moriep,
+                        "_mori_async_ll_supports_fp4_dispatch",
+                        return_value=False,
+                    ),
+                    patch.object(
                         moriep, "_aiter_supports_mxfp8_dispatch", return_value=mxfp8_ok
                     ),
                     patch.object(moriep, "is_gfx1250_supported", return_value=gfx1250),
                 ):
                     impl._restrict_transport_dtypes()
                 self.assertEqual(impl.dispatch_dtype, expected)
+
+    def test_async_ll_keeps_fp4_dispatch_when_mori_moves_it(self):
+        impl = self._make_dispatcher(DeepEPMode.LOW_LATENCY)._get_impl()
+        impl.quant_config = {"weight_dtype": torch.float4_e2m1fn_x2}
+        impl.dispatch_dtype = moriep.DispatchDtype.fp4
+        with patch.object(
+            moriep, "_mori_async_ll_supports_fp4_dispatch", return_value=True
+        ):
+            impl._restrict_transport_dtypes()
+        self.assertEqual(impl.dispatch_dtype, moriep.DispatchDtype.fp4)
+        self.assertEqual(impl.combine_dtype, moriep.CombineDtype.bf16)
 
 
 class TestMoriRecvBound(CustomTestCase):
