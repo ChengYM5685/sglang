@@ -615,6 +615,7 @@ class TboForwardBatchPreparer:
                 if is_enable_two_chunk
                 else batch.tbo_split_seq_index
             ),
+            first_child=True,
             out_num_token_non_padded=out_num_token_non_padded_a,
             out_num_token_non_padded_cpu=out_num_token_non_padded_cpu_a,
         )
@@ -624,6 +625,7 @@ class TboForwardBatchPreparer:
             end_token_index=batch.input_ids.shape[0],
             start_seq_index=batch.tbo_split_seq_index,
             end_seq_index=batch.batch_size,
+            first_child=False,
             out_num_token_non_padded=out_num_token_non_padded_b,
             out_num_token_non_padded_cpu=out_num_token_non_padded_cpu_b,
         )
@@ -732,6 +734,7 @@ class TboForwardBatchPreparer:
         end_token_index: int,
         start_seq_index: int,
         end_seq_index: int,
+        first_child: bool,
         out_num_token_non_padded: torch.Tensor,
         out_num_token_non_padded_cpu: Optional[int] = None,
     ):
@@ -901,7 +904,9 @@ class TboForwardBatchPreparer:
                 tbo_child_global_num_tokens_cpu=cls._child_global_num_tokens(
                     parent_global_num_tokens,
                     batch.tbo_global_split_num_tokens,
-                    first_child=start_token_index == 0,
+                    # Not start_token_index == 0: an idle or empty-split rank
+                    # starts both children at token 0.
+                    first_child=first_child,
                 ),
                 tbo_global_split_num_tokens=None,
                 tbo_children=None,
