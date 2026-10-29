@@ -503,6 +503,11 @@ class Envs:
     SGLANG_TBO_DEBUG = EnvBool(False)
     # Prefill batches with fewer tokens on any DP rank run without TBO.
     SGLANG_TBO_MIN_EXTEND_TOKENS = EnvInt(0)
+    # DSV4 EP prefill TBO: run each micro-batch's shared experts right after its
+    # combine send (in the MoE stage) instead of before its combine receive. The
+    # sibling's two transfers that are otherwise covered only by an MoE stage
+    # gain the shared-expert compute; experiment.
+    SGLANG_TBO_SHARED_IN_MOE_STAGE = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)

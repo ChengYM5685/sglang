@@ -4,6 +4,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.batch_overlap import operations
+from sglang.srt.environ import envs
 from sglang.srt.batch_overlap.operations import Operation
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -204,6 +205,12 @@ def _compute_moe_deepseek_v4_prefill(layer):
         ]
     else:
         # EP / mori a2a: reuse DeepseekV2MoE's deepep dispatch/combine ops.
+        # With micro-batches A and B, a transfer is hidden by the sibling's stage
+        # that runs between its send and its receive. B's dispatch and A's combine
+        # are covered only by an MoE stage (A's dispatch and B's combine by an
+        # attention stage, which is longer), so SGLANG_TBO_SHARED_IN_MOE_STAGE
+        # moves the shared experts into the MoE stage, after the combine send.
+        shared_in_moe_stage = envs.SGLANG_TBO_SHARED_IN_MOE_STAGE.get()
         ops = [
             layer.op_mhc_prepare_attn,
             layer.self_attn.op_attn,
@@ -215,8 +222,9 @@ def _compute_moe_deepseek_v4_prefill(layer):
             layer.mlp.op_dispatch_b,
             layer.mlp.op_experts,
             layer.mlp.op_combine_a,
+            *([layer.mlp.op_shared_experts] if shared_in_moe_stage else []),
             operations.YieldOperation(),
-            layer.mlp.op_shared_experts,
+            *([] if shared_in_moe_stage else [layer.mlp.op_shared_experts]),
             layer.mlp.op_combine_b,
             layer.mlp.op_output,
             layer.op_mhc_postprocess,
