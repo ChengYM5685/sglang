@@ -14,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_rows = TboForwardBatchPreparer._child_dp_global_num_tokens
+_rows = TboForwardBatchPreparer._child_global_num_tokens
 
 
 class TestTboChildDpRows(CustomTestCase):
@@ -30,9 +30,10 @@ class TestTboChildDpRows(CustomTestCase):
         self.assertEqual(_rows([10, 4], [12, -1], first_child=True), [10, 0])
         self.assertEqual(_rows([10, 4], [12, -1], first_child=False), [0, 4])
 
-    def test_missing_or_mismatched_split_keeps_parent_rows(self):
-        self.assertEqual(_rows([8, 8], None, first_child=False), [8, 8])
-        self.assertEqual(_rows([8, 8], [4], first_child=True), [8, 8])
+    def test_missing_or_mismatched_split_gives_none(self):
+        # The caller then bounds the micro-batch by the parent's rows.
+        self.assertIsNone(_rows([8, 8], None, first_child=False))
+        self.assertIsNone(_rows([8, 8], [4], first_child=True))
         self.assertIsNone(_rows(None, [4, 4], first_child=True))
 
 
