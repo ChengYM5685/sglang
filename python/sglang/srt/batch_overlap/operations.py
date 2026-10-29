@@ -116,7 +116,9 @@ def _tbo_side_stream() -> torch.cuda.Stream:
     device = torch.cuda.current_device()
     stream = _tbo_side_streams.get(device)
     if stream is None:
-        stream = _tbo_side_streams[device] = torch.cuda.Stream(device=device)
+        stream = _tbo_side_streams[device] = torch.cuda.Stream(
+            device=device, priority=envs.SGLANG_TBO_SIDE_STREAM_PRIORITY.get()
+        )
     return stream
 
 

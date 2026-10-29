@@ -514,6 +514,9 @@ class Envs:
     # Meant for MORI EPv2 AsyncLL, whose transfers run on SDMA; native EPv2
     # still shares one comm stream between the micro-batches. Experiment.
     SGLANG_TBO_DUAL_STREAM = EnvBool(False)
+    # Priority of the dual-stream side stream (micro-batch B); lower is higher
+    # priority, 0 matches the main stream. Experiment.
+    SGLANG_TBO_SIDE_STREAM_PRIORITY = EnvInt(0)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
