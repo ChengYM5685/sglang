@@ -8,6 +8,10 @@ the node). The mode is read from a file, re-checked at most every 0.5 s:
   parent       each TBO micro-batch is bounded by its parent batch's rows
   child+exact  child, plus the exact received row count in eager prefill
   parent+exact parent, plus the exact received row count in eager prefill
+  child+early  child+exact for native EPv2 TBO micro-batches, but the dispatch
+               starts in dispatch_a and the row count is copied to pinned host
+               memory on the comm stream, so dispatch_b waits for this
+               micro-batch's transfer only, not for its sibling's compute
 """
 
 import os
@@ -37,3 +41,7 @@ def use_child_rows() -> bool:
 
 def use_exact_cap() -> bool:
     return recv_cap_mode().endswith("+exact")
+
+
+def use_early_cap() -> bool:
+    return recv_cap_mode().endswith("+early")

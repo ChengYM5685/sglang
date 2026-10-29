@@ -12,7 +12,7 @@ from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.batch_overlap.recv_cap_mode import use_exact_cap
+from sglang.srt.batch_overlap.recv_cap_mode import use_early_cap, use_exact_cap
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -1683,7 +1683,16 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
                 ]
         self._routing = routing
         self._recv_topk_ids = recv_indices
-        if (
+        early_count = self._take_early_recv_count()
+        if early_count is not None:
+            # dispatch_a already started this transfer and its row-count copy on
+            # the comm stream; this waits for that copy alone, not for the compute
+            # stream, which holds the sibling micro-batch's queued work.
+            exact = round_logical_recv_rows(early_count, pow2_buckets=False)
+            physical = recv_hidden.shape[0]
+            if exact < (self._recv_cap if self._recv_cap > 0 else physical):
+                self._recv_cap = exact
+        elif (
             (_RECV_CAP_EXACT or use_exact_cap())
             and get_is_extend_in_batch()
             and total_recv is not None
@@ -1731,6 +1740,10 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
             recv_cap=self._recv_cap,
         )
 
+    def _take_early_recv_count(self):
+        """Received rows read back by an early dispatch (child+early), else None."""
+        return None
+
     def _combine_transport(self, hidden_states, topk_ids, topk_weights, ready_event):
         raise NotImplementedError
 
@@ -1751,6 +1764,11 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
         # _uses_async_ll): the send half returns at once and the recv half waits.
         if self._tbo_enabled and async_finish and not self._uses_async_ll:
             self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
+        # child+early: a transfer started in dispatch_a, consumed in dispatch_b,
+        # and the pinned host copy of its received row count.
+        self._early_dispatch = None
+        self._early_count_pending = None
+        self._early_count_host = None
 
     @property
     def _uses_async_ll(self) -> bool:
@@ -1769,9 +1787,53 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
             return None
         return super()._capture_event_if_async()
 
-    def _dispatch_transport(
-        self, hidden_states, topk_weights, topk_ids, scale, ready_event
-    ):
+    def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        state = super().dispatch_a(hidden_states, topk_output)
+        if not (
+            use_early_cap()
+            and self._use_comm_stream()
+            and get_is_extend_in_batch()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            return state
+        # child+early: start the transfer now instead of in dispatch_b, and copy
+        # its received row count to pinned host memory behind it on the comm
+        # stream. The sibling micro-batch's stage is queued between dispatch_a and
+        # dispatch_b, so when dispatch_b reads the count the host waits for this
+        # transfer only and the GPU still has the sibling's compute to run (a
+        # .item() on the compute stream waits for both and drains the queue).
+        hidden_states, topk_weights, topk_ids, scale, _, ready_event = state
+        # The same per-micro-batch bound dispatch_b would pick (from the sender
+        # rows dispatch_a just snapshotted); MoriEPDispatcher.dispatch_b recomputes
+        # it to the same value.
+        self._select_recv_cap()
+        result, done_event = self._dispatch_on_comm_stream(
+            hidden_states, topk_weights, topk_ids, scale, ready_event
+        )
+        count_event = None
+        total_recv = result[4]
+        if total_recv is not None:
+            count = total_recv.reshape(-1)[:1]
+            host = self._early_count_host
+            if host is None or host.dtype != count.dtype:
+                self._early_count_host = torch.empty(
+                    1, dtype=count.dtype, pin_memory=True
+                )
+            with torch.cuda.stream(self._comm_stream):
+                self._early_count_host.copy_(count, non_blocking=True)
+                count_event = torch.cuda.Event(blocking=False, interprocess=False)
+                count_event.record(self._comm_stream)
+        self._early_dispatch = (result, done_event, count_event)
+        return state
+
+    def _take_early_recv_count(self):
+        count_event, self._early_count_pending = self._early_count_pending, None
+        if count_event is None:
+            return None
+        count_event.synchronize()
+        return int(self._early_count_host[0])
+
+    def _dispatch_kwargs(self):
         kwargs = {"return_routing": True}
         if not self._uses_async_ll and _supports_dynamic_recv_cap(self.mori_op):
             # A manual cap is an exact MoE input limit, not a MORI graph tier.
@@ -1783,6 +1845,37 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
                 else self._recv_cap
             )
             kwargs.update(recv_cap=dispatch_cap, clone_routing=False)
+        return kwargs
+
+    def _dispatch_on_comm_stream(
+        self, hidden_states, topk_weights, topk_ids, scale, ready_event
+    ):
+        # No record_stream: the caller keeps the inputs alive until the compute
+        # stream has waited for done_event.
+        with torch.cuda.stream(self._comm_stream):
+            assert ready_event is not None
+            self._comm_stream.wait_event(ready_event)
+            result = self.mori_op.dispatch(
+                hidden_states,
+                topk_weights,
+                scale,
+                topk_ids,
+                **self._dispatch_kwargs(),
+            )
+            done_event = torch.cuda.Event(blocking=False, interprocess=False)
+            done_event.record(self._comm_stream)
+        return result, done_event
+
+    def _dispatch_transport(
+        self, hidden_states, topk_weights, topk_ids, scale, ready_event
+    ):
+        if self._early_dispatch is not None:
+            # Started in dispatch_a (child+early); its inputs stayed alive in the
+            # dispatcher state until this wait.
+            result, done_event, self._early_count_pending = self._early_dispatch
+            self._early_dispatch = None
+            torch.cuda.current_stream().wait_event(done_event)
+            return result
         if self.enable_sdma:
             # SDMA: send and receive back to back (see _uses_async_ll).
             result = self.mori_op.dispatch_send(
@@ -1791,21 +1884,17 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
             self.mori_op.dispatch_recv()
         elif not self._use_comm_stream():
             result = self.mori_op.dispatch(
-                hidden_states, topk_weights, scale, topk_ids, **kwargs
+                hidden_states,
+                topk_weights,
+                scale,
+                topk_ids,
+                **self._dispatch_kwargs(),
             )
         else:
-            compute_stream = torch.cuda.current_stream()
-            keepalive = (hidden_states, topk_weights, topk_ids, scale)
-            with torch.cuda.stream(self._comm_stream):
-                assert ready_event is not None
-                self._comm_stream.wait_event(ready_event)
-                result = self.mori_op.dispatch(
-                    hidden_states, topk_weights, scale, topk_ids, **kwargs
-                )
-                done_event = torch.cuda.Event(blocking=False, interprocess=False)
-                done_event.record(self._comm_stream)
-            compute_stream.wait_event(done_event)
-            del keepalive
+            result, done_event = self._dispatch_on_comm_stream(
+                hidden_states, topk_weights, topk_ids, scale, ready_event
+            )
+            torch.cuda.current_stream().wait_event(done_event)
         return result
 
     def _combine_transport(self, hidden_states, topk_ids, topk_weights, ready_event):
