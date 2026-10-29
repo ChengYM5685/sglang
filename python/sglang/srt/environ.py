@@ -508,6 +508,12 @@ class Envs:
     # sibling's two transfers that are otherwise covered only by an MoE stage
     # gain the shared-expert compute; experiment.
     SGLANG_TBO_SHARED_IN_MOE_STAGE = EnvBool(False)
+    # Run the second TBO micro-batch on its own stream, so a micro-batch waiting
+    # in a MoE receive does not hold up the other's independent work (single
+    # stream: everything queued behind the spinning receive waits with it).
+    # Meant for MORI EPv2 AsyncLL, whose transfers run on SDMA; native EPv2
+    # still shares one comm stream between the micro-batches. Experiment.
+    SGLANG_TBO_DUAL_STREAM = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)

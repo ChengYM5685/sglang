@@ -14,7 +14,10 @@ from typing import (
     Union,
 )
 
+import torch
+
 from sglang.srt.batch_overlap.recv_cap_mode import use_child_rows
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     set_dp_buffer_len,
@@ -69,6 +72,20 @@ def execute_overlapped_operations(
         "b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b, parent_rows=parent_rows
     )
     set_tbo_parent_dp_global_num_tokens(parent_rows)
+    # SGLANG_TBO_DUAL_STREAM: micro-batch A stays on the current stream, B runs
+    # on a side stream; the host still issues the stages in the same order.
+    dual = (
+        envs.SGLANG_TBO_DUAL_STREAM.get()
+        and not torch.cuda.is_current_stream_capturing()
+    )
+    if dual:
+        main_stream = torch.cuda.current_stream()
+        side_stream = _tbo_side_stream()
+        side_stream.wait_stream(main_stream)
+        # B's inputs come from the main stream's allocator pool: keep their
+        # blocks from being handed to A while B may still read them.
+        _record_tensors(inputs_b, side_stream)
+        executor_b = _OnStream(executor_b, side_stream)
     try:
         for _ in range(delta_stage):
             executor_a.next()
@@ -81,9 +98,55 @@ def execute_overlapped_operations(
             executor_b.next()
     finally:
         set_tbo_parent_dp_global_num_tokens(None)
+        if dual:
+            main_stream.wait_stream(side_stream)
 
     assert executor_a.done and executor_b.done
+    if dual:
+        # B's outputs come from the side stream's pool; the main stream uses
+        # them from here on.
+        _record_tensors(executor_b.output, main_stream)
     return [executor_a.output, executor_b.output]
+
+
+_tbo_side_streams: Dict[int, torch.cuda.Stream] = {}
+
+
+def _tbo_side_stream() -> torch.cuda.Stream:
+    device = torch.cuda.current_device()
+    stream = _tbo_side_streams.get(device)
+    if stream is None:
+        stream = _tbo_side_streams[device] = torch.cuda.Stream(device=device)
+    return stream
+
+
+def _record_tensors(values, stream: torch.cuda.Stream) -> None:
+    """record_stream every tensor directly in `values` (a dict, list or tuple, one
+    level of nesting), so the caching allocator waits for `stream` before reusing
+    its block."""
+    items = values.values() if isinstance(values, dict) else values
+    for v in items:
+        if isinstance(v, torch.Tensor):
+            v.record_stream(stream)
+        elif isinstance(v, (list, tuple)):
+            for t in v:
+                if isinstance(t, torch.Tensor):
+                    t.record_stream(stream)
+
+
+class _OnStream:
+    """A _StageExecutor whose stages run on `stream`."""
+
+    def __init__(self, executor: "_StageExecutor", stream: torch.cuda.Stream):
+        self._executor = executor
+        self._stream = stream
+
+    def next(self):
+        with torch.cuda.stream(self._stream):
+            self._executor.next()
+
+    def __getattr__(self, item):
+        return getattr(self._executor, item)
 
 
 def _resolve_tbo_child_contexts():
