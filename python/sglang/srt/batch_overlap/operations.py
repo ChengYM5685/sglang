@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextvars
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import (
@@ -85,6 +87,8 @@ def execute_overlapped_operations(
         # B's inputs come from the main stream's allocator pool: keep their
         # blocks from being handed to A while B may still read them.
         _record_tensors(inputs_b, side_stream)
+        if os.environ.get("SGLANG_TBO_SIDE_THREAD", "1") == "1":
+            _side_issuer()
         executor_b = _OnStream(executor_b, side_stream)
     try:
         for _ in range(delta_stage):
@@ -136,16 +140,64 @@ def _record_tensors(values, stream: torch.cuda.Stream) -> None:
                     t.record_stream(stream)
 
 
+_side_issuers: Dict[int, Any] = {}
+
+
+def _side_issuer():
+    """DIAG 10-31: one persistent host thread per device that issues micro-batch B's
+    stages. torch keeps one hipBLASLt handle per host thread, and two Stream-K GEMMs
+    running concurrently on two streams through the same handle can leave a workgroup
+    spinning in label_SK_Fixup forever; issuing B from its own thread gives B its own
+    handle. The main thread still waits for every B stage to be issued, so the host
+    order is unchanged."""
+    import concurrent.futures
+
+    device = torch.cuda.current_device()
+    pool = _side_issuers.get(device)
+    if pool is None:
+        pool = _side_issuers[device] = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="tbo-side-issuer",
+            initializer=torch.cuda.set_device,
+            initargs=(device,),
+        )
+
+        def warm():
+            # Create this thread's BLAS handles now, with the device drained, so the
+            # handle setup cannot race GEMMs already running on the main stream.
+            torch.cuda.synchronize()
+            a = torch.zeros(256, 256, device="cuda", dtype=torch.bfloat16)
+            torch.nn.functional.linear(a, a)
+            torch.cuda.synchronize()
+
+        pool.submit(warm).result()
+    return pool
+
+
 class _OnStream:
     """A _StageExecutor whose stages run on `stream`."""
 
     def __init__(self, executor: "_StageExecutor", stream: torch.cuda.Stream):
         self._executor = executor
         self._stream = stream
+        self._use_thread = os.environ.get("SGLANG_TBO_SIDE_THREAD", "1") == "1"
 
     def next(self):
-        with torch.cuda.stream(self._stream):
-            self._executor.next()
+        if not self._use_thread:
+            with torch.cuda.stream(self._stream):
+                self._executor.next()
+            return
+        inference = torch.is_inference_mode_enabled()
+        grad = torch.is_grad_enabled()
+        stream, executor = self._stream, self._executor
+
+        def run():
+            with torch.inference_mode(inference), torch.set_grad_enabled(grad):
+                with torch.cuda.stream(stream):
+                    executor.next()
+
+        ctx = contextvars.copy_context()
+        _side_issuer().submit(ctx.run, run).result()
 
     def __getattr__(self, item):
         return getattr(self._executor, item)
