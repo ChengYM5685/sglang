@@ -833,6 +833,13 @@ class _MoriEPDispatcherImplBase:
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
+        tbo_child_cap = envs.SGLANG_MORI_TBO_CHILD_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        if instance_id > 0 and tbo_child_cap > 0:
+            # Instance 1 only ever carries TBO micro-batch B; TboDPAttentionPreparer
+            # keeps any step whose micro-batch B exceeds this cap unsplit.
+            self.num_max_dispatch_tokens_per_rank = min(
+                tbo_child_cap, self.num_max_dispatch_tokens_per_rank
+            )
         self.dispatch_dtype = DispatchDtype.bf16
         self.combine_dtype = CombineDtype.bf16
         self.quant_config = {}

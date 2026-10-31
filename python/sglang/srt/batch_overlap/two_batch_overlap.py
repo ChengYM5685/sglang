@@ -80,6 +80,13 @@ def get_token_num_per_seq(
         return None
 
 
+def _mori_tbo_child_dispatch_cap() -> int:
+    """Rows per rank micro-batch B's MoRI op holds; 0 when it matches the main op."""
+    if not get_moe_a2a_backend().is_mori():
+        return 0
+    return envs.SGLANG_MORI_TBO_CHILD_MAX_DISPATCH_TOKENS_PER_RANK.get()
+
+
 # TODO: may smartly disable TBO when batch size is too small b/c it will slow down
 def compute_split_seq_index(
     forward_mode: ForwardMode,
@@ -482,6 +489,15 @@ class TboDPAttentionPreparer:
                     extend_seq_lens=local_batch.extend_lens,
                     token_num_per_seq=token_num_per_seq,
                 )
+                child_cap = _mori_tbo_child_dispatch_cap()
+                if (
+                    child_cap > 0
+                    and num_tokens - self.local_tbo_split_num_tokens > child_cap
+                ):
+                    # Micro-batch B dispatches on a MoRI op sized for child_cap rows
+                    # per rank; one such rank keeps the whole step unsplit.
+                    local_can_run_tbo = False
+                    self.local_tbo_split_num_tokens = 0
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True

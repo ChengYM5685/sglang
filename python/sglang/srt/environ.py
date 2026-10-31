@@ -901,6 +901,9 @@ class Envs:
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    # Rows per rank of the MoRI op behind TBO micro-batch B (instance 1); 0 sizes it
+    # like the main op. A split whose micro-batch B is larger runs unsplit.
+    SGLANG_MORI_TBO_CHILD_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(0)
     # Unset: EPv2 where moe_hook finds it supported (DeepSeek-V4 only), else EPv1.
     # true forces EPv2; false forces EPv1.
     SGLANG_MORI_EP_V2 = EnvBool(True)
