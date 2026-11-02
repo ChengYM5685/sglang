@@ -781,7 +781,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # gather carried every rank's split, else its parent's.
     tbo_dp_global_num_tokens_bound: Optional[List[int]] = None
     # Every DP rank's first-micro-batch rows, gathered with the TBO decision.
-    tbo_global_split_num_tokens: Optional[List[int]] = None
+    global_tbo_split_num_tokens: Optional[List[int]] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
@@ -1101,7 +1101,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
-            tbo_global_split_num_tokens=batch.tbo_global_split_num_tokens,
+            global_tbo_split_num_tokens=batch.global_tbo_split_num_tokens,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,

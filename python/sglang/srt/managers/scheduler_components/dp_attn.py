@@ -346,7 +346,7 @@ def _update_gather_batch(
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
-        batch.tbo_global_split_num_tokens = mlp_sync_info.global_tbo_split_num_tokens
+        batch.global_tbo_split_num_tokens = mlp_sync_info.global_tbo_split_num_tokens
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
     # Check forward mode for cuda graph

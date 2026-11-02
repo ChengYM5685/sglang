@@ -32,26 +32,24 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_rows = TboForwardBatchPreparer._child_dp_global_num_tokens
+_rows = TboForwardBatchPreparer._children_dp_global_num_tokens
 
 
 class TestTboChildDpRows(CustomTestCase):
     def test_children_partition_parent_rows(self):
         parent, split = [8192, 0, 6254, 3000], [4096, 0, 3127, 1400]
-        first = _rows(parent, split, first_child=True)
-        second = _rows(parent, split, first_child=False)
+        first, second = _rows(parent, split)
         self.assertEqual(first, [4096, 0, 3127, 1400])
         self.assertEqual(second, [4096, 0, 3127, 1600])
         self.assertEqual([a + b for a, b in zip(first, second)], parent)
 
     def test_split_is_clamped_to_parent_rows(self):
-        self.assertEqual(_rows([10, 4], [12, -1], first_child=True), [10, 0])
-        self.assertEqual(_rows([10, 4], [12, -1], first_child=False), [0, 4])
+        self.assertEqual(_rows([10, 4], [12, -1]), ([10, 0], [0, 4]))
 
     def test_missing_or_mismatched_split_keeps_parent_rows(self):
-        self.assertEqual(_rows([8, 8], None, first_child=False), [8, 8])
-        self.assertEqual(_rows([8, 8], [4], first_child=True), [8, 8])
-        self.assertIsNone(_rows(None, [4, 4], first_child=True))
+        self.assertEqual(_rows([8, 8], None), ([8, 8], [8, 8]))
+        self.assertEqual(_rows([8, 8], [4]), ([8, 8], [8, 8]))
+        self.assertEqual(_rows(None, [4, 4]), (None, None))
 
 
 def _idle_batch(parent_rows, split_rows) -> ForwardBatch:
@@ -70,33 +68,41 @@ def _idle_batch(parent_rows, split_rows) -> ForwardBatch:
     )
     batch.full_prefill_cuda_graph_capture = None
     batch.global_num_tokens_cpu = parent_rows
-    batch.tbo_global_split_num_tokens = split_rows
+    batch.global_tbo_split_num_tokens = split_rows
     return batch
 
 
 class TestTboIdleRankChildRows(CustomTestCase):
     def test_idle_rank_bounds_second_micro_batch_by_the_rest(self):
-        # An idle rank's split is 0, so both of its children span [0, 0).
+        """An idle rank's split is 0, so both of its children span [0, 0); the
+        bound goes by position, never by where a child starts."""
         parent, split = [0, 2080, 0, 0], [0, 1000, 0, 0]
-        rows = []
-        for first_child in (True, False):
+        batch = _idle_batch(parent, split)
+        children = []
+        for _ in range(2):
             with (
                 get_context().override_server_args(
                     attention_backend="fa3", moe_dense_tp_size=None
                 ),
                 get_parallel().override(attn_tp_size=1),
             ):
-                child = TboForwardBatchPreparer.filter_batch(
-                    _idle_batch(parent, split),
-                    start_token_index=0,
-                    end_token_index=0,
-                    start_seq_index=0,
-                    end_seq_index=0,
-                    first_child=first_child,
-                    out_num_token_non_padded=torch.tensor(0),
+                children.append(
+                    TboForwardBatchPreparer.filter_batch(
+                        batch,
+                        start_token_index=0,
+                        end_token_index=0,
+                        start_seq_index=0,
+                        end_seq_index=0,
+                        out_num_token_non_padded=torch.tensor(0),
+                    )
                 )
-            rows.append(child.tbo_dp_global_num_tokens_bound)
-        self.assertEqual(rows, [[0, 1000, 0, 0], [0, 1080, 0, 0]])
+        child_a, child_b = children
+        self.assertIsNone(child_a.tbo_dp_global_num_tokens_bound)
+        TboForwardBatchPreparer._bound_children_dp_rows(
+            batch, child_a=child_a, child_b=child_b
+        )
+        self.assertEqual(child_a.tbo_dp_global_num_tokens_bound, [0, 1000, 0, 0])
+        self.assertEqual(child_b.tbo_dp_global_num_tokens_bound, [0, 1080, 0, 0])
 
 
 def _micro_batch_b_rows(extend_lens) -> int:
