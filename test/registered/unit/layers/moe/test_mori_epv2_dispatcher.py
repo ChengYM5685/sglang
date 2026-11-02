@@ -45,6 +45,8 @@ def _fake_mori_modules():
 
 
 class _FakeOp:
+    capabilities = frozenset()
+
     def __init__(self, log):
         self.log = log
         self.cfg = SimpleNamespace(
@@ -253,15 +255,21 @@ class TestMoriEPv2Transport(_MoriEPv2TestCase):
                 dispatcher.dispatch_b()
                 self.assertEqual(self.log, expected)
 
-    def test_native_under_sbo_dispatches_beside_shared_experts(self):
-        """The native kernel has no send/recv halves, so under SBO dispatch_a must
-        issue it on a side stream and dispatch_b join it, for the shared experts in
-        the dispatch hook to overlap it; combine stays on the compute stream. TBO
-        and plain runs keep the dispatch in dispatch_b."""
+    def test_native_under_sbo_splits_around_shared_experts(self):
+        """Under SBO the native dispatch must send in dispatch_a and receive in
+        dispatch_b, on the compute stream, so the shared experts in the dispatch
+        hook run between the two; a MORI build without the split dispatches in
+        dispatch_b, as without SBO. Neither may take a side stream; only TBO's
+        micro-batches use the comm stream."""
         compute, side = _FakeStream(self.log, "compute"), _FakeStream(self.log, "side")
+
+        def stream_from_pool(group):
+            self.log.append("side_stream")
+            return side
+
         for item in (
             patch.object(
-                moriep.CommStreamPool, "get_stream_from_pool", return_value=side
+                moriep.CommStreamPool, "get_stream_from_pool", stream_from_pool
             ),
             patch.object(torch.cuda, "current_stream", return_value=compute),
             patch.object(torch.cuda, "stream", return_value=contextlib.nullcontext()),
@@ -269,25 +277,38 @@ class TestMoriEPv2Transport(_MoriEPv2TestCase):
         ):
             item.start()
             self.addCleanup(item.stop)
-        overlapped = ["side_waits", "dispatch", "shared", "compute_waits"]
-        on_comm_stream = ["shared", "side_waits", "dispatch", "compute_waits"]
-        for sbo, tbo, expected in (
-            (True, False, overlapped),
-            (True, True, on_comm_stream),
-            (False, False, ["shared", "dispatch"]),
+        split = ["dispatch_send", "shared", "dispatch_recv"]
+        on_comm_stream = [
+            "side_stream",
+            "shared",
+            "side_waits",
+            "dispatch",
+            "compute_waits",
+        ]
+        for sbo, tbo, can_split, expected in (
+            (True, False, True, split),
+            (True, False, False, ["shared", "dispatch"]),
+            (False, False, True, ["shared", "dispatch"]),
+            (True, True, True, on_comm_stream),
         ):
-            with self.subTest(sbo=sbo, tbo=tbo):
+            with self.subTest(sbo=sbo, tbo=tbo, can_split=can_split):
                 del self.log[:]
                 with get_flags().moe.override(sbo_enabled=sbo, tbo_enabled=tbo):
                     dispatcher = self._make_dispatcher(
                         DeepEPMode.NORMAL, async_finish=True
                     )
+                op = dispatcher._get_impl().mori_op
+                if can_split:
+                    op.capabilities = frozenset({"split_dispatch"})
                 hidden, topk_output = self._inputs()
 
                 dispatcher.dispatch_a(hidden, topk_output)
                 self.log.append("shared")
                 dispatched = dispatcher.dispatch_b()
                 self.assertEqual(self.log, expected)
+                # dispatch_b hands out the send half's buffers, which the receive
+                # fills.
+                self.assertIs(dispatched.hidden_states, op.dispatched[0])
                 if tbo:
                     continue
                 del self.log[:]

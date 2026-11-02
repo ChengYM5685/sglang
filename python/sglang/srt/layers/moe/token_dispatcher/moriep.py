@@ -1629,9 +1629,10 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
 
 class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
     """MORI EPv2's native dispatch/combine, on a comm stream for TBO micro-batches.
-    With ``overlap`` the dispatch is issued on a side stream in dispatch_a and
-    joined in dispatch_b, so SBO's shared experts in the dispatch hook compute
-    while it runs; combine stays on the compute stream."""
+    With ``overlap`` and a MORI build that splits the native dispatch, dispatch_a
+    runs its send half and dispatch_b its receive, so SBO's shared experts in the
+    dispatch hook run between them on the same stream; other builds dispatch in
+    dispatch_b, as without SBO."""
 
     def __init__(self, overlap: bool, async_finish: bool, **kwargs):
         super().__init__(async_finish=async_finish, **kwargs)
@@ -1639,26 +1640,38 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
         # comm stream with the events async_finish records.
         if self._tbo_enabled and async_finish:
             self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
-        # The native kernel has no send/recv halves, so overlap needs a stream.
-        self._overlap_stream = None
-        if overlap:
-            self._overlap_stream = CommStreamPool.get_stream_from_pool(self.group)
-        # (result, done event) of the dispatch in flight, joined by dispatch_b.
+        self._overlap = overlap
+        # Resolved on the first dispatch: the op may be built lazily.
+        self._split_dispatch = None
+        # The send half in flight, completed by dispatch_b.
         self._pending_dispatch = None
 
     @property
     def _uses_async_ll(self) -> bool:
         return False
 
+    def _splits_dispatch(self) -> bool:
+        if self._split_dispatch is None:
+            caps = getattr(self.mori_op, "capabilities", frozenset())
+            self._split_dispatch = self._overlap and "split_dispatch" in caps
+            if self._overlap and not self._split_dispatch:
+                logger.warning_once(
+                    "This MORI build cannot split the native EPv2 dispatch into "
+                    "send and receive, so single-batch overlap does not overlap "
+                    "it with the shared experts."
+                )
+        return self._split_dispatch
+
     def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         state = super().dispatch_a(hidden_states, topk_output)
-        if self._overlap_stream is not None:
-            # The dispatch takes its receive cap now, not in dispatch_b.
+        if self._splits_dispatch():
+            # The send takes its receive cap now, not in dispatch_b. The returned
+            # views are valid only after dispatch_recv; the inputs stay alive in
+            # `state` until then.
             self._select_recv_cap()
-            ready_event = torch.cuda.current_stream().record_event()
-            # The inputs stay alive in `state` until dispatch_b joins the stream.
-            self._pending_dispatch = self._issue_dispatch(
-                self._overlap_stream, ready_event, *state[:4]
+            hidden_states, topk_weights, topk_ids, scale = state[:4]
+            self._pending_dispatch = self.mori_op.dispatch_send(
+                hidden_states, topk_weights, scale, topk_ids, **self._dispatch_kwargs()
             )
         return state
 
@@ -1676,39 +1689,33 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
             kwargs.update(recv_cap=dispatch_cap, clone_routing=False)
         return kwargs
 
-    def _issue_dispatch(
-        self, stream, ready_event, hidden_states, topk_weights, topk_ids, scale
-    ):
-        kwargs = self._dispatch_kwargs()
-        with torch.cuda.stream(stream):
-            assert ready_event is not None
-            stream.wait_event(ready_event)
-            result = self.mori_op.dispatch(
-                hidden_states, topk_weights, scale, topk_ids, **kwargs
-            )
-            done_event = torch.cuda.Event(blocking=False, interprocess=False)
-            done_event.record(stream)
-        return result, done_event
-
     def _dispatch_transport(
         self, hidden_states, topk_weights, topk_ids, scale, ready_event
     ):
-        if self._overlap_stream is not None:
-            pending = self._pending_dispatch
+        if self._splits_dispatch():
+            result = self._pending_dispatch
             self._pending_dispatch = None
-            assert pending is not None, "MORI EPv2 dispatch_b without dispatch_a"
-            result, done_event = pending
-            torch.cuda.current_stream().wait_event(done_event)
-        elif self._comm_stream is None:
+            assert result is not None, "MORI EPv2 dispatch_b without dispatch_a"
+            # Waits for every peer's count; the shared experts ran before it.
+            self.mori_op.dispatch_recv()
+            return result
+        kwargs = self._dispatch_kwargs()
+        if self._comm_stream is None:
             result = self.mori_op.dispatch(
-                hidden_states, topk_weights, scale, topk_ids, **self._dispatch_kwargs()
+                hidden_states, topk_weights, scale, topk_ids, **kwargs
             )
         else:
+            compute_stream = torch.cuda.current_stream()
             keepalive = (hidden_states, topk_weights, topk_ids, scale)
-            result, done_event = self._issue_dispatch(
-                self._comm_stream, ready_event, *keepalive
-            )
-            torch.cuda.current_stream().wait_event(done_event)
+            with torch.cuda.stream(self._comm_stream):
+                assert ready_event is not None
+                self._comm_stream.wait_event(ready_event)
+                result = self.mori_op.dispatch(
+                    hidden_states, topk_weights, scale, topk_ids, **kwargs
+                )
+                done_event = torch.cuda.Event(blocking=False, interprocess=False)
+                done_event.record(self._comm_stream)
+            compute_stream.wait_event(done_event)
             del keepalive
         return result
 
@@ -1876,8 +1883,8 @@ class MoriEPDispatcher(BaseDispatcher):
                     overlap=sbo_overlap, async_finish=async_finish, **common_kwargs
                 )
             else:
-                # Under SBO the dispatch runs on a side stream from dispatch_a to
-                # dispatch_b, beside the shared experts.
+                # Under SBO a MORI build that splits the native dispatch sends in
+                # dispatch_a and receives in dispatch_b, around the shared experts.
                 self._normal_dispatcher = _MoriEPv2DispatcherImplNormal(
                     overlap=sbo_overlap, async_finish=async_finish, **common_kwargs
                 )
