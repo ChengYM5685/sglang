@@ -156,6 +156,9 @@ def mori_tbo_side_stream_enabled() -> bool:
     its receive does not hold up the sibling's independent work."""
     if not (get_moe_a2a_backend().is_mori() and envs.SGLANG_MORI_EP_V2.get()):
         return False
+    # PROTOTYPE knob (not for the PR): 0 keeps micro-batch B on the main stream.
+    if not get_bool_env_var("SGLANG_PROTO_TBO_SIDE_STREAM", "true"):
+        return False
     deepep_mode = get_deepep_mode()
     if deepep_mode == DeepEPMode.AUTO:
         deepep_mode = DeepEPMode.NORMAL
@@ -1815,6 +1818,57 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         # Send halves in flight, completed by dispatch_b / combine_b.
         self._pending_dispatch = None
         self._pending_combine = None
+        # PROTOTYPE (not for the PR): with SGLANG_PROTO_ASYNCLL_RECV_STREAM=1 a TBO
+        # micro-batch issues each receive on this dispatcher's own stream right
+        # after its send, so the receive spins and copies while the sibling
+        # computes, and the compute stream only waits on an event in *_b (EPv1's
+        # SDMA path does the same on its comm stream). One stream per dispatcher,
+        # so the two micro-batches' receives do not queue behind each other.
+        self._recv_stream = (
+            torch.cuda.Stream()
+            if overlap
+            and self._tbo_enabled
+            and get_bool_env_var("SGLANG_PROTO_ASYNCLL_RECV_STREAM", "false")
+            else None
+        )
+        self._pending_dispatch_done = None
+        self._pending_combine_done = None
+        if self._recv_stream is not None and get_bool_env_var(
+            "MORI_ASYNCLL_FUSED_RECV", "false"
+        ):
+            # Full-grid fused receives spinning beside compute hang the device.
+            raise ValueError(
+                "SGLANG_PROTO_ASYNCLL_RECV_STREAM=1 cannot run with "
+                "MORI_ASYNCLL_FUSED_RECV=1"
+            )
+        if self._recv_stream is not None:
+            logger.warning_once(
+                "PROTOTYPE SGLANG_PROTO_ASYNCLL_RECV_STREAM=1: AsyncLL receives of "
+                "TBO micro-batches run on their own stream"
+            )
+
+    def _use_recv_stream(self) -> bool:
+        return (
+            self._recv_stream is not None
+            and self._in_tbo_subbatch
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _recv_on_stream(self, recv) -> torch.cuda.Event:
+        """Issue `recv` on the receive stream behind the send just queued on the
+        current stream; return the event the compute stream waits on in *_b.
+
+        No record_stream (see _MoriEPDispatcherImplNormal.dispatch_b): the send
+        inputs stay referenced until *_b, which makes the compute stream wait on
+        the returned event before anything can reuse their blocks."""
+        sent = torch.cuda.Event(blocking=False, interprocess=False)
+        sent.record()
+        with torch.cuda.stream(self._recv_stream):
+            self._recv_stream.wait_event(sent)
+            recv()
+            done = torch.cuda.Event(blocking=False, interprocess=False)
+            done.record(self._recv_stream)
+        return done
 
     @property
     def _uses_async_ll(self) -> bool:
@@ -1830,6 +1884,10 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         )
         if not self._overlap:
             self.mori_op.dispatch_recv()
+        elif self._use_recv_stream():
+            self._pending_dispatch_done = self._recv_on_stream(
+                self.mori_op.dispatch_recv
+            )
         return state
 
     def _dispatch_transport(
@@ -1839,7 +1897,11 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         self._pending_dispatch = None
         assert result is not None, "MORI EPv2 AsyncLL dispatch_b without dispatch_a"
         if self._overlap:
-            self.mori_op.dispatch_recv()
+            done, self._pending_dispatch_done = self._pending_dispatch_done, None
+            if done is not None:
+                torch.cuda.current_stream().wait_event(done)
+            else:
+                self.mori_op.dispatch_recv()
         return result
 
     def combine_a(
@@ -1855,6 +1917,8 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         )
         if not self._overlap:
             self.mori_op.combine_recv()
+        elif self._use_recv_stream():
+            self._pending_combine_done = self._recv_on_stream(self.mori_op.combine_recv)
         return state
 
     def _combine_transport(self, hidden_states, topk_ids, topk_weights, ready_event):
@@ -1862,7 +1926,11 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         self._pending_combine = None
         assert out is not None, "MORI EPv2 AsyncLL combine_b without combine_a"
         if self._overlap:
-            self.mori_op.combine_recv()
+            done, self._pending_combine_done = self._pending_combine_done, None
+            if done is not None:
+                torch.cuda.current_stream().wait_event(done)
+            else:
+                self.mori_op.combine_recv()
         return out
 
 
