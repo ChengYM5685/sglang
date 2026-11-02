@@ -136,7 +136,10 @@ class TestTboChildDispatchCap(CustomTestCase):
             extend_num_tokens=sum(extend_lens),
             is_extend_in_batch=True,
         )
-        backend = Mock(is_none=Mock(return_value=False))
+        backend = Mock(
+            is_none=Mock(return_value=False),
+            tbo_child_dispatch_cap=Mock(return_value=child_cap),
+        )
         preparer = TboDPAttentionPreparer()
         with (
             patch.object(two_batch_overlap, "is_tbo_enabled", return_value=True),
@@ -145,9 +148,6 @@ class TestTboChildDispatchCap(CustomTestCase):
             ),
             patch.object(
                 two_batch_overlap, "get_deepep_mode", return_value=DeepEPMode.NORMAL
-            ),
-            patch.object(
-                two_batch_overlap, "mori_tbo_child_dispatch_cap", return_value=child_cap
             ),
         ):
             can_run, mode = preparer.prepare_all_gather(batch)
