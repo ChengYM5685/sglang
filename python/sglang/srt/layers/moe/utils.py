@@ -114,6 +114,17 @@ class MoeA2ABackend(Enum):
         # does not have to block TBO on them.
         return self.is_mori_epv2()
 
+    def tbo_micro_batch_b_on_side_stream(self) -> bool:
+        # Only MORI EPv2 AsyncLL: its MoE receive spins on the compute stream, so on
+        # one stream the sibling micro-batch's independent work waits with it.
+        if not self.is_mori_epv2():
+            return False
+        from sglang.srt.layers.moe.token_dispatcher.moriep import (
+            mori_tbo_side_stream_enabled,
+        )
+
+        return mori_tbo_side_stream_enabled()
+
 
 @dataclass
 class AscendOpsConfig:

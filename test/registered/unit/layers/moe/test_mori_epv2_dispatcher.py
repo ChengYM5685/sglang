@@ -360,7 +360,12 @@ class TestMoriTboSideStream(CustomTestCase):
         with get_flags().moe.override(
             a2a_backend=MoeA2ABackend(backend), deepep_mode=deepep_mode
         ):
-            return moriep.mori_tbo_side_stream_enabled()
+            enabled = moriep.mori_tbo_side_stream_enabled()
+            # TBO asks the a2a backend, which must give the same answer.
+            self.assertEqual(
+                MoeA2ABackend(backend).tbo_micro_batch_b_on_side_stream(), enabled
+            )
+            return enabled
 
     def test_only_async_ll_runs_micro_batch_b_on_a_side_stream(self):
         for kwargs, expected in (
@@ -388,7 +393,7 @@ class TestMoriTboSideStream(CustomTestCase):
         import threading
         from contextlib import nullcontext
 
-        from sglang.srt.batch_overlap import operations
+        from sglang.srt.batch_overlap import operations, side_stream
         from sglang.srt.batch_overlap.operations import (
             YieldOperation,
             execute_overlapped_operations,
@@ -429,9 +434,9 @@ class TestMoriTboSideStream(CustomTestCase):
             device=torch.device("cuda", 0), wait_stream=lambda s: None
         )
         with (
-            patch.object(operations, "_micro_batch_b_side_stream", return_value=stream),
-            patch.object(operations, "_create_blas_handle"),
-            patch.object(operations, "_side_issuers", {}),
+            patch.object(operations, "tbo_side_stream", return_value=stream),
+            patch.object(side_stream, "_create_blas_handle"),
+            patch.object(side_stream, "_side_issuers", {}),
             patch.object(torch.cuda, "current_stream", return_value=stream),
             patch.object(torch.cuda, "set_device"),
             patch.object(torch.cuda, "stream", return_value=nullcontext()),
@@ -442,7 +447,7 @@ class TestMoriTboSideStream(CustomTestCase):
             execute_overlapped_operations(
                 inputs, [operations_list] * 2, delta_stages=[0, 1]
             )
-            operations._side_issuers[0].shutdown()
+            side_stream._side_issuers[0].shutdown()
         self.assertEqual(
             seen,
             [
