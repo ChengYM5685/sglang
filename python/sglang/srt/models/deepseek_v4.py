@@ -175,7 +175,9 @@ from sglang.srt.models.deepseek_v2 import (
 )
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
+    DSparkTboCapture,
     NonCudaDecoderMixin,
+    capture_dspark_tbo_share,
     forward_layer_fused_boundary,
     fused_boundary_attn_input,
 )
@@ -3691,10 +3693,7 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         hidden_states = residual_batch.read_output(
             hidden_states, batch, hc_boundary.FinalRead(), None
         )
-        # DSpark: this ubatch's share of a captured layer; _forward_layers_tbo merges.
-        dspark_capture = getattr(batch, "dspark_capture", None)
-        if dspark_capture is not None and self.layer_id in dspark_capture[0]:
-            dspark_capture[1].append(hidden_states.mean(dim=1))
+        capture_dspark_tbo_share(batch, self.layer_id, hidden_states)
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
@@ -4376,10 +4375,17 @@ class DeepseekV4Model(nn.Module):
                 tp_group.all_gatherv(local_ids_shard, sizes=tp_sizes, output=gids)
                 child._tbo_global_input_ids = gids
 
-        if dspark_aux_hidden_states is not None:
-            capture_layers = set(self.dspark_layers_to_capture)
-            for child in forward_batch.tbo_children:
-                child.dspark_capture = (capture_layers, [])
+        capture_layers = (
+            frozenset(self.dspark_layers_to_capture)
+            if dspark_aux_hidden_states is not None
+            else None
+        )
+        for child in forward_batch.tbo_children:
+            child._dspark_tbo_capture = (
+                None
+                if capture_layers is None
+                else DSparkTboCapture(layer_ids=capture_layers)
+            )
 
         try:
             outputs_arr = execute_overlapped_operations(
@@ -4394,7 +4400,9 @@ class DeepseekV4Model(nn.Module):
                 # layer order; stitch each pair back into the parent's rows.
                 child_a, child_b = forward_batch.tbo_children
                 for share_a, share_b in zip(
-                    child_a.dspark_capture[1], child_b.dspark_capture[1], strict=True
+                    child_a._dspark_tbo_capture.shares,
+                    child_b._dspark_tbo_capture.shares,
+                    strict=True,
                 ):
                     dspark_aux_hidden_states.append(
                         _model_forward_tbo_merge_values(
@@ -4405,9 +4413,8 @@ class DeepseekV4Model(nn.Module):
                 outputs_arr[0], outputs_arr[1], "hidden_states", num_tokens
             )
         finally:
-            if dspark_aux_hidden_states is not None:
-                for child in forward_batch.tbo_children:
-                    child.dspark_capture = None
+            for child in forward_batch.tbo_children:
+                child._dspark_tbo_capture = None
             if _is_cuda:
                 for child in forward_batch.tbo_children:
                     residual_batch.clear(child)
