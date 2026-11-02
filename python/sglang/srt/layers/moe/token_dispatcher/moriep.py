@@ -1628,22 +1628,41 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
 
 
 class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
-    """MORI EPv2's native dispatch/combine, on a comm stream for TBO micro-batches."""
+    """MORI EPv2's native dispatch/combine, on a comm stream for TBO micro-batches.
+    With ``overlap`` the dispatch is issued on a side stream in dispatch_a and
+    joined in dispatch_b, so SBO's shared experts in the dispatch hook compute
+    while it runs; combine stays on the compute stream."""
 
-    def __init__(self, async_finish: bool, **kwargs):
+    def __init__(self, overlap: bool, async_finish: bool, **kwargs):
         super().__init__(async_finish=async_finish, **kwargs)
         # Same dual-stream setup as EPv1 normal; dispatch_b/combine_b order the
         # comm stream with the events async_finish records.
         if self._tbo_enabled and async_finish:
             self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
+        # The native kernel has no send/recv halves, so overlap needs a stream.
+        self._overlap_stream = None
+        if overlap:
+            self._overlap_stream = CommStreamPool.get_stream_from_pool(self.group)
+        # (result, done event) of the dispatch in flight, joined by dispatch_b.
+        self._pending_dispatch = None
 
     @property
     def _uses_async_ll(self) -> bool:
         return False
 
-    def _dispatch_transport(
-        self, hidden_states, topk_weights, topk_ids, scale, ready_event
-    ):
+    def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        state = super().dispatch_a(hidden_states, topk_output)
+        if self._overlap_stream is not None:
+            # The dispatch takes its receive cap now, not in dispatch_b.
+            self._select_recv_cap()
+            ready_event = torch.cuda.current_stream().record_event()
+            # The inputs stay alive in `state` until dispatch_b joins the stream.
+            self._pending_dispatch = self._issue_dispatch(
+                self._overlap_stream, ready_event, *state[:4]
+            )
+        return state
+
+    def _dispatch_kwargs(self) -> dict:
         kwargs = {"return_routing": True}
         if _supports_dynamic_recv_cap(self.mori_op):
             # A manual cap is an exact MoE input limit, not a MORI graph tier.
@@ -1655,22 +1674,41 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
                 else self._recv_cap
             )
             kwargs.update(recv_cap=dispatch_cap, clone_routing=False)
-        if self._comm_stream is None:
+        return kwargs
+
+    def _issue_dispatch(
+        self, stream, ready_event, hidden_states, topk_weights, topk_ids, scale
+    ):
+        kwargs = self._dispatch_kwargs()
+        with torch.cuda.stream(stream):
+            assert ready_event is not None
+            stream.wait_event(ready_event)
             result = self.mori_op.dispatch(
                 hidden_states, topk_weights, scale, topk_ids, **kwargs
             )
+            done_event = torch.cuda.Event(blocking=False, interprocess=False)
+            done_event.record(stream)
+        return result, done_event
+
+    def _dispatch_transport(
+        self, hidden_states, topk_weights, topk_ids, scale, ready_event
+    ):
+        if self._overlap_stream is not None:
+            pending = self._pending_dispatch
+            self._pending_dispatch = None
+            assert pending is not None, "MORI EPv2 dispatch_b without dispatch_a"
+            result, done_event = pending
+            torch.cuda.current_stream().wait_event(done_event)
+        elif self._comm_stream is None:
+            result = self.mori_op.dispatch(
+                hidden_states, topk_weights, scale, topk_ids, **self._dispatch_kwargs()
+            )
         else:
-            compute_stream = torch.cuda.current_stream()
             keepalive = (hidden_states, topk_weights, topk_ids, scale)
-            with torch.cuda.stream(self._comm_stream):
-                assert ready_event is not None
-                self._comm_stream.wait_event(ready_event)
-                result = self.mori_op.dispatch(
-                    hidden_states, topk_weights, scale, topk_ids, **kwargs
-                )
-                done_event = torch.cuda.Event(blocking=False, interprocess=False)
-                done_event.record(self._comm_stream)
-            compute_stream.wait_event(done_event)
+            result, done_event = self._issue_dispatch(
+                self._comm_stream, ready_event, *keepalive
+            )
+            torch.cuda.current_stream().wait_event(done_event)
             del keepalive
         return result
 
@@ -1822,6 +1860,9 @@ class MoriEPDispatcher(BaseDispatcher):
         )
 
         if self._is_epv2:
+            # SBO's shared experts run in the dispatch hook between dispatch_a and
+            # dispatch_b; TBO keeps its micro-batches back to back.
+            sbo_overlap = is_sbo_enabled() and not is_tbo_enabled()
             # deepep_mode is normal or low_latency here; auto became normal above.
             if self.deepep_mode.enable_low_latency():
                 self._low_latency_dispatcher = _MoriEPv2DispatcherImplAsyncLL(
@@ -1832,13 +1873,13 @@ class MoriEPDispatcher(BaseDispatcher):
                 # receive waits for dispatch_b, so the shared experts run while the
                 # copy engine moves the tokens.
                 self._normal_dispatcher = _MoriEPv2DispatcherImplAsyncLL(
-                    overlap=is_sbo_enabled() and not is_tbo_enabled(),
-                    async_finish=async_finish,
-                    **common_kwargs,
+                    overlap=sbo_overlap, async_finish=async_finish, **common_kwargs
                 )
             else:
+                # Under SBO the dispatch runs on a side stream from dispatch_a to
+                # dispatch_b, beside the shared experts.
                 self._normal_dispatcher = _MoriEPv2DispatcherImplNormal(
-                    async_finish=async_finish, **common_kwargs
+                    overlap=sbo_overlap, async_finish=async_finish, **common_kwargs
                 )
         else:
             if self.deepep_mode.enable_low_latency():

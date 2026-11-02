@@ -4,6 +4,7 @@ The MORI op is a fake that logs its calls, so these pin which calls each mode
 makes and when, not what the kernels compute.
 """
 
+import contextlib
 import os
 import sys
 import unittest
@@ -87,6 +88,26 @@ class _FakeOp:
 
     def combine_recv(self):
         self.log.append("combine_recv")
+
+
+class _FakeEvent:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def record(self, stream=None):
+        pass
+
+
+class _FakeStream:
+    def __init__(self, log, name):
+        self.log = log
+        self.name = name
+
+    def record_event(self):
+        return _FakeEvent()
+
+    def wait_event(self, event):
+        self.log.append(f"{self.name}_waits")
 
 
 class _MoriEPv2TestCase(CustomTestCase):
@@ -231,6 +252,53 @@ class TestMoriEPv2Transport(_MoriEPv2TestCase):
                 self.log.append("shared")
                 dispatcher.dispatch_b()
                 self.assertEqual(self.log, expected)
+
+    def test_native_under_sbo_dispatches_beside_shared_experts(self):
+        """The native kernel has no send/recv halves, so under SBO dispatch_a must
+        issue it on a side stream and dispatch_b join it, for the shared experts in
+        the dispatch hook to overlap it; combine stays on the compute stream. TBO
+        and plain runs keep the dispatch in dispatch_b."""
+        compute, side = _FakeStream(self.log, "compute"), _FakeStream(self.log, "side")
+        for item in (
+            patch.object(
+                moriep.CommStreamPool, "get_stream_from_pool", return_value=side
+            ),
+            patch.object(torch.cuda, "current_stream", return_value=compute),
+            patch.object(torch.cuda, "stream", return_value=contextlib.nullcontext()),
+            patch.object(torch.cuda, "Event", _FakeEvent),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+        overlapped = ["side_waits", "dispatch", "shared", "compute_waits"]
+        on_comm_stream = ["shared", "side_waits", "dispatch", "compute_waits"]
+        for sbo, tbo, expected in (
+            (True, False, overlapped),
+            (True, True, on_comm_stream),
+            (False, False, ["shared", "dispatch"]),
+        ):
+            with self.subTest(sbo=sbo, tbo=tbo):
+                del self.log[:]
+                with get_flags().moe.override(sbo_enabled=sbo, tbo_enabled=tbo):
+                    dispatcher = self._make_dispatcher(
+                        DeepEPMode.NORMAL, async_finish=True
+                    )
+                hidden, topk_output = self._inputs()
+
+                dispatcher.dispatch_a(hidden, topk_output)
+                self.log.append("shared")
+                dispatched = dispatcher.dispatch_b()
+                self.assertEqual(self.log, expected)
+                if tbo:
+                    continue
+                del self.log[:]
+                dispatcher.combine(
+                    (
+                        dispatched.hidden_states,
+                        dispatched.topk_ids,
+                        dispatched.topk_weights,
+                    )
+                )
+                self.assertEqual(self.log, ["combine"])
 
 
 if __name__ == "__main__":
