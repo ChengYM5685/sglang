@@ -1,8 +1,7 @@
 """TBO must not split a verify batch whose spec input it cannot split.
 
 split_spec_info only knows EagleVerifyInput. With a spec-v2 algorithm such as
-DSpark the verify input (DFlashVerifyInput) has no retrieve_index, so splitting
-it crashes, both on the eager path (TboForwardBatchPreparer.prepare) and while
+DSpark the verify input (DFlashVerifyInput) is not one, so splitting it crashes, both on the eager path (TboForwardBatchPreparer.prepare) and while
 capturing decode CUDA graphs (TboCudaGraphRunnerPlugin.capture_one_batch_size,
 which calls prepare_raw directly). Idle DP ranks join such a step as IDLE with
 the same kind of verify input, and must skip the split too.
@@ -20,6 +19,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context, get_device
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,7 +27,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _VerifyInput:
-    """A verify input without EAGLE's retrieve_* fields (like DFlashVerifyInput)."""
+    """A verify input that is not an EagleVerifyInput (like DFlashVerifyInput)."""
 
     draft_token_num = 4
 
@@ -35,8 +35,23 @@ class _VerifyInput:
         return True
 
 
-class _EagleVerifyInput(_VerifyInput):
+class _NgramLikeVerifyInput(_VerifyInput):
+    """Has EAGLE's field names but is no dataclass, like NgramVerifyInput, so
+    split_spec_info's dataclasses.replace cannot split it either."""
+
     retrieve_index = None
+
+
+class _EagleVerifyInput(EagleVerifyInput):
+    """An EagleVerifyInput, the kind split_spec_info splits; fields left unset."""
+
+    draft_token_num = 4
+
+    def __init__(self):
+        pass
+
+    def is_verify_input(self):
+        return True
 
 
 class _DraftInput:
@@ -55,6 +70,7 @@ class TestTboUnsplittableVerify(CustomTestCase):
         for mode, spec_info, expected in (
             (ForwardMode.TARGET_VERIFY, _VerifyInput(), True),
             (ForwardMode.IDLE, _VerifyInput(), True),
+            (ForwardMode.TARGET_VERIFY, _NgramLikeVerifyInput(), True),
             (ForwardMode.TARGET_VERIFY, _EagleVerifyInput(), False),
             # DSpark idle batches carry a draft input between verify steps; they
             # must keep joining an EXTEND step's TBO.

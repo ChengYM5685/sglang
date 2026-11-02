@@ -341,14 +341,17 @@ def compute_split_indices_for_cuda_graph_replay(
 
 def _verify_input_blocks_split(batch) -> bool:
     """A verify step (idle DP ranks carry the same input) whose spec input
-    split_spec_info cannot split, e.g. DSpark's DFlashVerifyInput. Every rank
-    runs it without TBO so the MoE collectives still pair up."""
+    split_spec_info cannot split: it only splits EagleVerifyInput (dataclasses.replace
+    over EAGLE's fields), not e.g. DSpark's DFlashVerifyInput or NgramVerifyInput.
+    Every rank runs it without TBO so the MoE collectives still pair up."""
+    from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
     spec_info = batch.spec_info
     return (
         (batch.forward_mode.is_target_verify() or batch.forward_mode.is_idle())
         and spec_info is not None
         and spec_info.is_verify_input()
-        and not hasattr(spec_info, "retrieve_index")
+        and not isinstance(spec_info, EagleVerifyInput)
     )
 
 
