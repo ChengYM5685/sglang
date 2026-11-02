@@ -1758,6 +1758,41 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         # Send halves in flight, completed by dispatch_b / combine_b.
         self._pending_dispatch = None
         self._pending_combine = None
+        # PROTOTYPE (not for a PR): with SGLANG_PROTO_ASYNCLL_RECV_STREAM=1 each
+        # receive is issued on this dispatcher's own stream right after its send
+        # (also under CUDA graph capture, as a fork/join), so its spin-wait and
+        # copy run beside the compute queued between *_a and *_b; the compute
+        # stream only waits on an event in *_b.
+        self._recv_stream = (
+            torch.cuda.Stream()
+            if overlap and get_bool_env_var("SGLANG_PROTO_ASYNCLL_RECV_STREAM", "false")
+            else None
+        )
+        self._pending_dispatch_done = None
+        self._pending_combine_done = None
+        if self._recv_stream is not None:
+            if get_bool_env_var("MORI_ASYNCLL_FUSED_RECV", "false"):
+                raise ValueError(
+                    "SGLANG_PROTO_ASYNCLL_RECV_STREAM=1 cannot run with "
+                    "MORI_ASYNCLL_FUSED_RECV=1"
+                )
+            logger.warning(
+                "PROTOTYPE SGLANG_PROTO_ASYNCLL_RECV_STREAM=1: AsyncLL receives "
+                "run on their own stream"
+            )
+
+    def _recv_on_stream(self, recv) -> torch.cuda.Event:
+        """Issue `recv` on the receive stream behind the send just queued on the
+        current stream; return the event the compute stream waits on in *_b.
+        The send inputs stay referenced until *_b, so no record_stream."""
+        sent = torch.cuda.Event()
+        sent.record()
+        with torch.cuda.stream(self._recv_stream):
+            self._recv_stream.wait_event(sent)
+            recv()
+            done = torch.cuda.Event()
+            done.record(self._recv_stream)
+        return done
 
     @property
     def _uses_async_ll(self) -> bool:
@@ -1773,6 +1808,10 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         )
         if not self._overlap:
             self.mori_op.dispatch_recv()
+        elif self._recv_stream is not None:
+            self._pending_dispatch_done = self._recv_on_stream(
+                self.mori_op.dispatch_recv
+            )
         return state
 
     def _dispatch_transport(
@@ -1782,7 +1821,11 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         self._pending_dispatch = None
         assert result is not None, "MORI EPv2 AsyncLL dispatch_b without dispatch_a"
         if self._overlap:
-            self.mori_op.dispatch_recv()
+            done, self._pending_dispatch_done = self._pending_dispatch_done, None
+            if done is not None:
+                torch.cuda.current_stream().wait_event(done)
+            else:
+                self.mori_op.dispatch_recv()
         return result
 
     def combine_a(
@@ -1798,6 +1841,8 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         )
         if not self._overlap:
             self.mori_op.combine_recv()
+        elif self._recv_stream is not None:
+            self._pending_combine_done = self._recv_on_stream(self.mori_op.combine_recv)
         return state
 
     def _combine_transport(self, hidden_states, topk_ids, topk_weights, ready_event):
@@ -1805,7 +1850,11 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         self._pending_combine = None
         assert out is not None, "MORI EPv2 AsyncLL combine_b without combine_a"
         if self._overlap:
-            self.mori_op.combine_recv()
+            done, self._pending_combine_done = self._pending_combine_done, None
+            if done is not None:
+                torch.cuda.current_stream().wait_event(done)
+            else:
+                self.mori_op.combine_recv()
         return out
 
 
