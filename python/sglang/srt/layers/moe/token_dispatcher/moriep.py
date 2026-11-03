@@ -1861,6 +1861,32 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         for v in os.environ.get("SGLANG_EXP_ASYNCLL_RECV_DELAY_US", "0,0").split(",")
     )
     _exp_sleep_cpu = None
+    # EXPERIMENT (SGLANG_EXP_ASYNCLL_COMM=gate): dispatch receives waiting for the
+    # next MoE stage-1 launch on the compute stream (the sibling micro-batch's moe1),
+    # so their recvcopy lands on its moe2. Combine stays on the compute stream.
+    _EXP_PENDING: list = []
+
+    @staticmethod
+    def _exp_install_stage1_gate() -> None:
+        from aiter.ops.flydsl import moe_kernels
+
+        if getattr(moe_kernels, "_exp_gate_installed", False):
+            return
+        orig = moe_kernels.flydsl_moe_stage1
+
+        def flydsl_moe_stage1(*args, **kwargs):
+            out = orig(*args, **kwargs)
+            pending = _MoriEPv2DispatcherImplAsyncLL._EXP_PENDING
+            if pending:
+                callbacks = list(pending)
+                pending.clear()
+                for cb in callbacks:
+                    cb()
+            return out
+
+        moe_kernels.flydsl_moe_stage1 = flydsl_moe_stage1
+        moe_kernels._exp_gate_installed = True
+        logger.info("EXPERIMENT AsyncLL gate: wrapped aiter flydsl_moe_stage1")
     # One side stream per TBO child (instance_id), shared by every MoE layer.
     _EXP_STREAMS: dict = {}
 
@@ -1872,8 +1898,11 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         self._pending_combine = None
         self._exp_dispatch_done = None
         self._exp_combine_done = None
+        self._exp_gate_cb = None
         if self._EXP_COMM:
             logger.info_once(f"EXPERIMENT SGLANG_EXP_ASYNCLL_COMM={self._EXP_COMM}")
+        if self._EXP_COMM == "gate":
+            self._exp_install_stage1_gate()
         if (
             self._EXP_COMM in ("recv", "both")
             and max(self._EXP_RECV_DELAY_US) > 0
@@ -1895,7 +1924,7 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
 
     def _exp_side_stream(self):
         if (
-            self._EXP_COMM not in ("recv", "both")
+            self._EXP_COMM not in ("recv", "both", "gate")
             or not self._overlap
             or not self._in_tbo_subbatch
             or torch.cuda.is_current_stream_capturing()
@@ -1940,6 +1969,31 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         # alive in `state` until then.
         hidden_states, topk_weights, topk_ids, scale = state[:4]
         side = self._exp_side_stream()
+        if side is not None and self._EXP_COMM == "gate":
+            compute = torch.cuda.current_stream()
+            self._pending_dispatch = self.mori_op.dispatch_send(
+                hidden_states, topk_weights, scale, topk_ids, return_routing=True
+            )
+            sent = torch.cuda.Event()
+            sent.record(compute)
+
+            def launch_recv(side=side, sent=sent):
+                if self._exp_gate_cb is None:
+                    return
+                self._exp_gate_cb = None
+                # After this rank's own send, and after whatever the current
+                # stream has queued so far (the sibling's moe1 when gated).
+                side.wait_event(sent)
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    self.mori_op.dispatch_recv()
+                    done = torch.cuda.Event()
+                    done.record(side)
+                self._exp_dispatch_done = done
+
+            self._exp_gate_cb = launch_recv
+            self._EXP_PENDING.append(launch_recv)
+            return state
         if side is not None:
             compute = torch.cuda.current_stream()
             if self._EXP_COMM == "both":
@@ -1974,6 +2028,14 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         result = self._pending_dispatch
         self._pending_dispatch = None
         assert result is not None, "MORI EPv2 AsyncLL dispatch_b without dispatch_a"
+        if self._exp_gate_cb is not None:
+            # No MoE stage-1 ran since the send (e.g. an empty sibling): launch now.
+            cb = self._exp_gate_cb
+            try:
+                self._EXP_PENDING.remove(cb)
+            except ValueError:
+                pass
+            cb()
         if self._exp_dispatch_done is not None:
             compute = torch.cuda.current_stream()
             compute.wait_event(self._exp_dispatch_done)
@@ -1991,7 +2053,7 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         state = super().combine_a(hidden_states, topk_ids, topk_weights)
-        side = self._exp_side_stream()
+        side = None if self._EXP_COMM == "gate" else self._exp_side_stream()
         if side is not None:
             compute = torch.cuda.current_stream()
             if self._EXP_COMM == "both":
