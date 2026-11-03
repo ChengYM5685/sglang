@@ -2029,13 +2029,19 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         self._pending_dispatch = None
         assert result is not None, "MORI EPv2 AsyncLL dispatch_b without dispatch_a"
         if self._exp_gate_cb is not None:
-            # No MoE stage-1 ran since the send (e.g. an empty sibling): launch now.
+            # No MoE stage-1 ran since the send: with tbo_delta_stages=0 this is
+            # always micro-batch A (only B's receive has A's moe1 in between) or an
+            # empty sibling. Nothing to hide it behind, so receive on the compute
+            # stream exactly as the baseline does (no side-stream round trip).
             cb = self._exp_gate_cb
+            self._exp_gate_cb = None
             try:
                 self._EXP_PENDING.remove(cb)
             except ValueError:
                 pass
-            cb()
+            self._exp_dispatch_done = None
+            self.mori_op.dispatch_recv()
+            return result
         if self._exp_dispatch_done is not None:
             compute = torch.cuda.current_stream()
             compute.wait_event(self._exp_dispatch_done)
