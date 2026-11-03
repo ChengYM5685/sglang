@@ -1863,8 +1863,11 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
             # also came from; an aliased side stream silently serialises again.
             avoid = {torch.cuda.current_stream().cuda_stream}
             avoid.update(s.cuda_stream for s in self._EXP_STREAMS.values())
+            # SGLANG_EXP_ASYNCLL_SIDE_PRIO=-1 draws from the high-priority pool,
+            # which the (normal-priority) compute stream never comes from.
+            prio = int(os.environ.get("SGLANG_EXP_ASYNCLL_SIDE_PRIO", "0"))
             for _ in range(65):
-                stream = torch.cuda.Stream()
+                stream = torch.cuda.Stream(priority=prio)
                 if stream.cuda_stream not in avoid:
                     break
             else:
@@ -1872,7 +1875,7 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
             self._EXP_STREAMS[self.instance_id] = stream
             logger.info(
                 f"EXPERIMENT AsyncLL side stream instance={self.instance_id} "
-                f"stream={stream.cuda_stream:#x} "
+                f"stream={stream.cuda_stream:#x} priority={stream.priority} "
                 f"compute={torch.cuda.current_stream().cuda_stream:#x}"
             )
         return stream
