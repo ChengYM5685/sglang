@@ -1463,6 +1463,29 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPv1DispatcherImplBase):
         return combined_hidden_states
 
 
+def _exp_sleep_cycles_per_us() -> float:
+    # EXPERIMENT: torch.cuda._sleep spins one thread on the shader clock (no memory
+    # traffic). Calibrate its cycles per microsecond once, on an idle device, after
+    # a long spin so the clock has ramped.
+    torch.cuda.synchronize()
+    torch.cuda._sleep(50_000_000)
+    torch.cuda.synchronize()
+    n = 2_000_000
+    best = None
+    for _ in range(5):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        torch.cuda._sleep(n)
+        end.record()
+        end.synchronize()
+        ms = start.elapsed_time(end)
+        best = ms if best is None else min(best, ms)
+    cycles_per_us = n / (best * 1000.0)
+    logger.info(f"EXPERIMENT torch.cuda._sleep calibration: {cycles_per_us:.0f} cycles/us")
+    return cycles_per_us
+
+
 def _exp_pin_asyncll_grid(blocks: int) -> None:
     # EXPERIMENT: MORI's AsyncLL copy passes take gridX = mpCount (CU count, aligned
     # down to world_size), never block_num; only blockX follows warp_num_per_block.
@@ -1831,6 +1854,13 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
     """
 
     _EXP_COMM = os.environ.get("SGLANG_EXP_ASYNCLL_COMM", "")
+    # EXPERIMENT: delay (us) the side-stream receive after the send, so it does not
+    # spin while the transfer drains: "dispatch_us,combine_us".
+    _EXP_RECV_DELAY_US = tuple(
+        float(v)
+        for v in os.environ.get("SGLANG_EXP_ASYNCLL_RECV_DELAY_US", "0,0").split(",")
+    )
+    _exp_sleep_cpu = None
     # One side stream per TBO child (instance_id), shared by every MoE layer.
     _EXP_STREAMS: dict = {}
 
@@ -1844,6 +1874,20 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         self._exp_combine_done = None
         if self._EXP_COMM:
             logger.info_once(f"EXPERIMENT SGLANG_EXP_ASYNCLL_COMM={self._EXP_COMM}")
+        if (
+            self._EXP_COMM in ("recv", "both")
+            and max(self._EXP_RECV_DELAY_US) > 0
+            and _MoriEPv2DispatcherImplAsyncLL._exp_sleep_cpu is None
+        ):
+            _MoriEPv2DispatcherImplAsyncLL._exp_sleep_cpu = _exp_sleep_cycles_per_us()
+            logger.info_once(
+                f"EXPERIMENT recv delay us (dispatch, combine)={self._EXP_RECV_DELAY_US}"
+            )
+
+    def _exp_recv_delay(self, leg: int) -> None:
+        us = self._EXP_RECV_DELAY_US[leg]
+        if us > 0:
+            torch.cuda._sleep(int(us * self._exp_sleep_cpu))
 
     @property
     def _uses_async_ll(self) -> bool:
@@ -1910,6 +1954,7 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
                 )
                 side.wait_stream(compute)
             with torch.cuda.stream(side):
+                self._exp_recv_delay(0)
                 self.mori_op.dispatch_recv()
                 done = torch.cuda.Event()
                 done.record(side)
@@ -1961,6 +2006,7 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
                 )
                 side.wait_stream(compute)
             with torch.cuda.stream(side):
+                self._exp_recv_delay(1)
                 self.mori_op.combine_recv()
                 done = torch.cuda.Event()
                 done.record(side)
