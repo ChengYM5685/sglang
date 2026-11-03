@@ -159,6 +159,43 @@ class TestMoriEPv2Transport(_MoriEPv2TestCase):
         self.assertEqual(self.log, ["combine_send", "sibling", "combine_recv"])
         self.assertIs(combined, op.combined)
 
+    def test_normal_sdma_defers_receive_only_in_micro_batches(self):
+        """normal + SDMA receives right after each send in an ordinary forward, but
+        a TBO micro-batch must leave the receive for *_b; on a single compute stream
+        nothing else can overlap the transfer."""
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        os.environ["MORI_ENABLE_SDMA"] = "1"
+        dispatcher = self._make_dispatcher(DeepEPMode.NORMAL)
+        hidden, topk_output = self._inputs()
+
+        def run():
+            del self.log[:]
+            dispatcher.dispatch_a(hidden, topk_output)
+            self.log.append("sibling")
+            dispatched = dispatcher.dispatch_b()
+            dispatcher.combine_a(
+                (dispatched.hidden_states, dispatched.topk_ids, dispatched.topk_weights)
+            )
+            self.log.append("sibling")
+            dispatcher.combine_b()
+            return list(self.log)
+
+        self.assertEqual(
+            run(),
+            ["dispatch_send", "dispatch_recv", "sibling"]
+            + ["combine_send", "combine_recv", "sibling"],
+        )
+        with forward_context(ForwardContext(attn_backend=None, is_micro_batch=True)):
+            self.assertEqual(
+                run(),
+                ["dispatch_send", "sibling", "dispatch_recv"]
+                + ["combine_send", "sibling", "combine_recv"],
+            )
+
 
 class TestMoriRecvBound(CustomTestCase):
     """A TBO micro-batch may use its parent batch's DP rows only as an upper bound."""
