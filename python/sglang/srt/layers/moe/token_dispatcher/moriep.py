@@ -1463,6 +1463,26 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPv1DispatcherImplBase):
         return combined_hidden_states
 
 
+def _exp_pin_asyncll_grid(blocks: int) -> None:
+    # EXPERIMENT: MORI's AsyncLL copy passes take gridX = mpCount (CU count, aligned
+    # down to world_size), never block_num; only blockX follows warp_num_per_block.
+    from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+
+    cls = EpDispatchCombineOpHip
+    if "_exp_orig_asyncll_request" not in cls.__dict__:
+        orig = cls._asyncll_request
+
+        def _asyncll_request(self, *args, **kwargs):
+            request = orig(self, *args, **kwargs)
+            request["mpCount"] = cls._exp_mp_count
+            return request
+
+        cls._exp_orig_asyncll_request = orig
+        cls._asyncll_request = _asyncll_request
+    cls._exp_mp_count = blocks
+    logger.info_once(f"EXPERIMENT AsyncLL copy-pass grid pinned: mpCount={blocks}")
+
+
 class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
     _is_epv2 = True
 
@@ -1489,6 +1509,7 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
         exp_blocks = int(os.environ.get("SGLANG_EXP_ASYNCLL_BLOCKS", "0"))
         if self._uses_async_ll and exp_blocks > 0:
             self._launch_config = _MoriEPv2LaunchConfig(exp_blocks, 8, exp_blocks, 8)
+            _exp_pin_asyncll_grid(exp_blocks)
         self._mori_op = None
         self.fp8_quant_func = None
         self.fp4_quant_func = None
@@ -1810,6 +1831,8 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
     """
 
     _EXP_COMM = os.environ.get("SGLANG_EXP_ASYNCLL_COMM", "")
+    # One side stream per TBO child (instance_id), shared by every MoE layer.
+    _EXP_STREAMS: dict = {}
 
     def __init__(self, overlap: bool, async_finish: bool, **kwargs):
         super().__init__(async_finish=async_finish, **kwargs)
@@ -1817,7 +1840,6 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         # Send halves in flight, completed by dispatch_b / combine_b.
         self._pending_dispatch = None
         self._pending_combine = None
-        self._exp_stream = None
         self._exp_dispatch_done = None
         self._exp_combine_done = None
         if self._EXP_COMM:
@@ -1835,9 +1857,25 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
             or torch.cuda.is_current_stream_capturing()
         ):
             return None
-        if self._exp_stream is None:
-            self._exp_stream = torch.cuda.Stream()
-        return self._exp_stream
+        stream = self._EXP_STREAMS.get(self.instance_id)
+        if stream is None:
+            # torch.cuda.Stream() round-robins a 32-entry pool the compute stream
+            # also came from; an aliased side stream silently serialises again.
+            avoid = {torch.cuda.current_stream().cuda_stream}
+            avoid.update(s.cuda_stream for s in self._EXP_STREAMS.values())
+            for _ in range(65):
+                stream = torch.cuda.Stream()
+                if stream.cuda_stream not in avoid:
+                    break
+            else:
+                raise RuntimeError("EXPERIMENT: no side stream distinct from compute")
+            self._EXP_STREAMS[self.instance_id] = stream
+            logger.info(
+                f"EXPERIMENT AsyncLL side stream instance={self.instance_id} "
+                f"stream={stream.cuda_stream:#x} "
+                f"compute={torch.cuda.current_stream().cuda_stream:#x}"
+            )
+        return stream
 
     @staticmethod
     def _exp_hand_back(result, compute):
@@ -1874,6 +1912,7 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
                 done.record(side)
             self._exp_dispatch_done = done
             return state
+        self._exp_dispatch_done = None
         self._pending_dispatch = self.mori_op.dispatch_send(
             hidden_states, topk_weights, scale, topk_ids, return_routing=True
         )
@@ -1924,6 +1963,7 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
                 done.record(side)
             self._exp_combine_done = done
             return state
+        self._exp_combine_done = None
         # The output is valid only after combine_recv.
         self._pending_combine, _ = self.mori_op.combine_send(
             hidden_states, None, self._recv_topk_ids, routing=self._routing
