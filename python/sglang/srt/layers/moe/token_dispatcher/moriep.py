@@ -1710,18 +1710,52 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
 
 
 class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
-    """MORI EPv2's native dispatch/combine, on a comm stream for TBO micro-batches."""
+    """MORI EPv2's native dispatch/combine, on a comm stream for TBO micro-batches.
+    With ``overlap`` and a MORI build that splits the native dispatch, dispatch_a
+    runs its send half and dispatch_b its receive, so SBO's shared experts in the
+    dispatch hook run between them on the same stream; other builds dispatch in
+    dispatch_b, as without SBO."""
 
-    def __init__(self, async_finish: bool, **kwargs):
+    def __init__(self, overlap: bool, async_finish: bool, **kwargs):
         super().__init__(async_finish=async_finish, **kwargs)
         # Same dual-stream setup as EPv1 normal; dispatch_b/combine_b order the
         # comm stream with the events async_finish records.
         if self._tbo_enabled and async_finish:
             self._comm_stream = CommStreamPool.get_stream_from_pool(self.group)
+        self._overlap = overlap
+        # Resolved on the first dispatch: the op may be built lazily.
+        self._split_dispatch = None
+        # The send half in flight, completed by dispatch_b.
+        self._pending_dispatch = None
 
     @property
     def _uses_async_ll(self) -> bool:
         return False
+
+    def _splits_dispatch(self) -> bool:
+        if self._split_dispatch is None:
+            caps = getattr(self.mori_op, "capabilities", frozenset())
+            self._split_dispatch = self._overlap and "split_dispatch" in caps
+            if self._overlap and not self._split_dispatch:
+                logger.warning_once(
+                    "This MORI build cannot split the native EPv2 dispatch into "
+                    "send and receive, so single-batch overlap does not overlap "
+                    "it with the shared experts."
+                )
+        return self._split_dispatch
+
+    def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        state = super().dispatch_a(hidden_states, topk_output)
+        if self._splits_dispatch():
+            # The send takes its receive cap now, not in dispatch_b. The returned
+            # views are valid only after dispatch_recv; the inputs stay alive in
+            # `state` until then.
+            self._select_recv_cap()
+            hidden_states, topk_weights, topk_ids, scale = state[:4]
+            self._pending_dispatch = self.mori_op.dispatch_send(
+                hidden_states, topk_weights, scale, topk_ids, **self._dispatch_kwargs()
+            )
+        return state
 
     def _use_comm_stream(self) -> bool:
         # Only a TBO micro-batch has a sibling to overlap with; other forwards of
@@ -1733,9 +1767,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
             return None
         return super()._capture_event_if_async()
 
-    def _dispatch_transport(
-        self, hidden_states, topk_weights, topk_ids, scale, ready_event
-    ):
+    def _dispatch_kwargs(self) -> dict:
         kwargs = {"return_routing": True}
         if _supports_dynamic_recv_cap(self.mori_op):
             # A manual cap is an exact MoE input limit, not a MORI graph tier.
@@ -1747,6 +1779,19 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
                 else self._recv_cap
             )
             kwargs.update(recv_cap=dispatch_cap, clone_routing=False)
+        return kwargs
+
+    def _dispatch_transport(
+        self, hidden_states, topk_weights, topk_ids, scale, ready_event
+    ):
+        if self._splits_dispatch():
+            result = self._pending_dispatch
+            self._pending_dispatch = None
+            assert result is not None, "MORI EPv2 dispatch_b without dispatch_a"
+            # Waits for every peer's count; the shared experts ran before it.
+            self.mori_op.dispatch_recv()
+            return result
+        kwargs = self._dispatch_kwargs()
         if not self._use_comm_stream():
             result = self.mori_op.dispatch(
                 hidden_states, topk_weights, scale, topk_ids, **kwargs
@@ -1929,8 +1974,12 @@ class MoriEPDispatcher(BaseDispatcher):
                     **common_kwargs,
                 )
             else:
+                # Under SBO a MORI build that splits the native dispatch sends in
+                # dispatch_a and receives in dispatch_b, around the shared experts.
                 self._normal_dispatcher = _MoriEPv2DispatcherImplNormal(
-                    async_finish=async_finish, **common_kwargs
+                    overlap=is_sbo_enabled() and not is_tbo_enabled(),
+                    async_finish=async_finish,
+                    **common_kwargs,
                 )
         else:
             if self.deepep_mode.enable_low_latency():
