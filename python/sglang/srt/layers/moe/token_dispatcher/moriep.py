@@ -1485,6 +1485,10 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
         self._launch_config = _get_epv2_launch_config(
             self._tbo_enabled and not self._uses_async_ll
         )
+        # EXPERIMENT: pin the AsyncLL grid (blocks x 8 warps) for both legs.
+        exp_blocks = int(os.environ.get("SGLANG_EXP_ASYNCLL_BLOCKS", "0"))
+        if self._uses_async_ll and exp_blocks > 0:
+            self._launch_config = _MoriEPv2LaunchConfig(exp_blocks, 8, exp_blocks, 8)
         self._mori_op = None
         self.fp8_quant_func = None
         self.fp4_quant_func = None
@@ -1795,7 +1799,17 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
 class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
     """MORI EPv2 on its AsyncLL send/recv kernels. With ``overlap`` each send runs
     in *_a and its receive in *_b, so a TBO sibling batch computes while the
-    transfer drains; without it the receive follows the send at once."""
+    transfer drains; without it the receive follows the send at once.
+
+    EXPERIMENT (SGLANG_EXP_ASYNCLL_COMM): for TBO micro-batches only, move the
+    AsyncLL kernels off the compute stream onto this dispatcher's own stream.
+    "recv": send stays on the compute stream, the receive (spin + recvcopy) is
+    queued on the side stream right after it in *_a; *_b only makes the compute
+    stream wait for it. "both": send and receive both on the side stream, after
+    the compute stream's work so far (the producer of the inputs).
+    """
+
+    _EXP_COMM = os.environ.get("SGLANG_EXP_ASYNCLL_COMM", "")
 
     def __init__(self, overlap: bool, async_finish: bool, **kwargs):
         super().__init__(async_finish=async_finish, **kwargs)
@@ -1803,16 +1817,63 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         # Send halves in flight, completed by dispatch_b / combine_b.
         self._pending_dispatch = None
         self._pending_combine = None
+        self._exp_stream = None
+        self._exp_dispatch_done = None
+        self._exp_combine_done = None
+        if self._EXP_COMM:
+            logger.info_once(f"EXPERIMENT SGLANG_EXP_ASYNCLL_COMM={self._EXP_COMM}")
 
     @property
     def _uses_async_ll(self) -> bool:
         return True
+
+    def _exp_side_stream(self):
+        if (
+            self._EXP_COMM not in ("recv", "both")
+            or not self._overlap
+            or not self._in_tbo_subbatch
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        if self._exp_stream is None:
+            self._exp_stream = torch.cuda.Stream()
+        return self._exp_stream
+
+    @staticmethod
+    def _exp_hand_back(result, compute):
+        # Tensors created on the side stream are used on the compute stream.
+        for t in result if isinstance(result, (tuple, list)) else (result,):
+            if isinstance(t, torch.Tensor):
+                try:
+                    t.record_stream(compute)
+                except Exception:
+                    pass
 
     def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         state = super().dispatch_a(hidden_states, topk_output)
         # The returned views are valid only after dispatch_recv; the inputs stay
         # alive in `state` until then.
         hidden_states, topk_weights, topk_ids, scale = state[:4]
+        side = self._exp_side_stream()
+        if side is not None:
+            compute = torch.cuda.current_stream()
+            if self._EXP_COMM == "both":
+                side.wait_stream(compute)
+                with torch.cuda.stream(side):
+                    self._pending_dispatch = self.mori_op.dispatch_send(
+                        hidden_states, topk_weights, scale, topk_ids, return_routing=True
+                    )
+            else:
+                self._pending_dispatch = self.mori_op.dispatch_send(
+                    hidden_states, topk_weights, scale, topk_ids, return_routing=True
+                )
+                side.wait_stream(compute)
+            with torch.cuda.stream(side):
+                self.mori_op.dispatch_recv()
+                done = torch.cuda.Event()
+                done.record(side)
+            self._exp_dispatch_done = done
+            return state
         self._pending_dispatch = self.mori_op.dispatch_send(
             hidden_states, topk_weights, scale, topk_ids, return_routing=True
         )
@@ -1826,6 +1887,12 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         result = self._pending_dispatch
         self._pending_dispatch = None
         assert result is not None, "MORI EPv2 AsyncLL dispatch_b without dispatch_a"
+        if self._exp_dispatch_done is not None:
+            compute = torch.cuda.current_stream()
+            compute.wait_event(self._exp_dispatch_done)
+            self._exp_dispatch_done = None
+            self._exp_hand_back(result, compute)
+            return result
         if self._overlap:
             self.mori_op.dispatch_recv()
         return result
@@ -1837,6 +1904,26 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         state = super().combine_a(hidden_states, topk_ids, topk_weights)
+        side = self._exp_side_stream()
+        if side is not None:
+            compute = torch.cuda.current_stream()
+            if self._EXP_COMM == "both":
+                side.wait_stream(compute)
+                with torch.cuda.stream(side):
+                    self._pending_combine, _ = self.mori_op.combine_send(
+                        hidden_states, None, self._recv_topk_ids, routing=self._routing
+                    )
+            else:
+                self._pending_combine, _ = self.mori_op.combine_send(
+                    hidden_states, None, self._recv_topk_ids, routing=self._routing
+                )
+                side.wait_stream(compute)
+            with torch.cuda.stream(side):
+                self.mori_op.combine_recv()
+                done = torch.cuda.Event()
+                done.record(side)
+            self._exp_combine_done = done
+            return state
         # The output is valid only after combine_recv.
         self._pending_combine, _ = self.mori_op.combine_send(
             hidden_states, None, self._recv_topk_ids, routing=self._routing
@@ -1849,6 +1936,12 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         out = self._pending_combine
         self._pending_combine = None
         assert out is not None, "MORI EPv2 AsyncLL combine_b without combine_a"
+        if self._exp_combine_done is not None:
+            compute = torch.cuda.current_stream()
+            compute.wait_event(self._exp_combine_done)
+            self._exp_combine_done = None
+            self._exp_hand_back(out, compute)
+            return out
         if self._overlap:
             self.mori_op.combine_recv()
         return out
