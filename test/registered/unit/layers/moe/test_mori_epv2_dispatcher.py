@@ -89,6 +89,17 @@ class _FakeOp:
         self.log.append("combine_recv")
 
 
+class _TaggedLog:
+    """Prefixes each logged call with the op's micro-batch."""
+
+    def __init__(self, log, tag):
+        self._log = log
+        self._tag = tag
+
+    def append(self, call):
+        self._log.append(f"{self._tag}.{call}")
+
+
 class _MoriEPv2TestCase(CustomTestCase):
     def setUp(self):
         reset_context()
@@ -195,6 +206,58 @@ class TestMoriEPv2Transport(_MoriEPv2TestCase):
                 ["dispatch_send", "sibling", "dispatch_recv"]
                 + ["combine_send", "sibling", "combine_recv"],
             )
+
+    def test_peer_recv_first_keeps_one_transfer_in_flight(self):
+        """Prototype order: each TBO send first drains the sibling micro-batch's
+        pending receive, so the two micro-batches' transfers never overlap, and the
+        last receive still runs in its own *_b."""
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        envs.SGLANG_PROTO_ASYNCLL_PEER_RECV_FIRST.set(True)
+        self.addCleanup(moriep._TBO_DEFERRED_RECV.clear)
+
+        def make(instance_id):
+            dispatcher = MoriEPDispatcher(
+                group=None,
+                router_topk=_TOPK,
+                hidden_size=_HIDDEN,
+                params_dtype=torch.bfloat16,
+                deepep_mode=DeepEPMode.LOW_LATENCY,
+                instance_id=instance_id,
+            )
+            tag = "AB"[instance_id]
+            dispatcher._get_impl()._mori_op = _FakeOp(_TaggedLog(self.log, tag))
+            return dispatcher
+
+        a, b = make(0), make(1)
+        hidden, topk_output = self._inputs()
+        # The stage order of the DSV4 prefill TBO strategy.
+        with forward_context(ForwardContext(attn_backend=None, is_micro_batch=True)):
+            a.dispatch_a(hidden, topk_output)
+            b.dispatch_a(hidden, topk_output)
+            out = a.dispatch_b()
+            a.combine_a((out.hidden_states, out.topk_ids, out.topk_weights))
+            out = b.dispatch_b()
+            b.combine_a((out.hidden_states, out.topk_ids, out.topk_weights))
+            a.combine_b()
+            b.combine_b()
+        self.assertEqual(
+            self.log,
+            [
+                "A.dispatch_send",
+                "A.dispatch_recv",
+                "B.dispatch_send",
+                "B.dispatch_recv",
+                "A.combine_send",
+                "A.combine_recv",
+                "B.combine_send",
+                "B.combine_recv",
+            ],
+        )
+        self.assertEqual(moriep._TBO_DEFERRED_RECV, {})
 
 
 class TestMoriRecvBound(CustomTestCase):

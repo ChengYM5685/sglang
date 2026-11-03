@@ -1746,6 +1746,12 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
         return out
 
 
+# Under SGLANG_PROTO_ASYNCLL_PEER_RECV_FIRST: by instance_id (the TBO micro-batch),
+# the AsyncLL impl whose receive waits for *_b. Layers share each instance's op, so
+# at most one receive per instance is pending.
+_TBO_DEFERRED_RECV: dict[int, _MoriEPv2DispatcherImplAsyncLL] = {}
+
+
 class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
     """MORI EPv2 on its AsyncLL send/recv kernels. With ``overlap``, or inside a
     TBO micro-batch, each send runs in *_a and its receive in *_b, so a TBO
@@ -1760,6 +1766,7 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         self._pending_combine = None
         # The receive a send left for *_b, if any.
         self._deferred_recv = None
+        self._peer_recv_first = envs.SGLANG_PROTO_ASYNCLL_PEER_RECV_FIRST.get()
 
     @property
     def _uses_async_ll(self) -> bool:
@@ -1770,6 +1777,7 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         # The returned views are valid only after dispatch_recv; the inputs stay
         # alive in `state` until then.
         hidden_states, topk_weights, topk_ids, scale = state[:4]
+        self._run_peer_deferred_recv()
         self._pending_dispatch = self.mori_op.dispatch_send(
             hidden_states, topk_weights, scale, topk_ids, return_routing=True
         )
@@ -1793,6 +1801,7 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
     ):
         state = super().combine_a(hidden_states, topk_ids, topk_weights)
         # The output is valid only after combine_recv.
+        self._run_peer_deferred_recv()
         self._pending_combine, _ = self.mori_op.combine_send(
             hidden_states, None, self._recv_topk_ids, routing=self._routing
         )
@@ -1811,13 +1820,25 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         # normal + SDMA enters AsyncLL without overlap, yet TBO still splits it.
         if self._overlap or self._in_tbo_subbatch:
             self._deferred_recv = recv
+            if self._peer_recv_first and self._in_tbo_subbatch:
+                _TBO_DEFERRED_RECV[self.instance_id] = self
         else:
             recv()
 
     def _run_deferred_recv(self) -> None:
+        if _TBO_DEFERRED_RECV.get(self.instance_id) is self:
+            del _TBO_DEFERRED_RECV[self.instance_id]
         recv, self._deferred_recv = self._deferred_recv, None
         if recv is not None:
             recv()
+
+    def _run_peer_deferred_recv(self) -> None:
+        # Drain the sibling's transfer before this send, so the SDMA queues never
+        # hold both micro-batches' packets and a receive never waits on the other's.
+        if self._peer_recv_first and self._in_tbo_subbatch:
+            peer = _TBO_DEFERRED_RECV.pop(1 - self.instance_id, None)
+            if peer is not None:
+                peer._run_deferred_recv()
 
 
 class _Stage(Enum):

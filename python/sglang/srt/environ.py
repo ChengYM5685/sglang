@@ -971,6 +971,9 @@ class Envs:
     # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
     # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.
     SGLANG_MORI_RECV_BOUND = EnvBool(False)
+    # Prototype, not for upstream: under TBO an AsyncLL send first runs the sibling
+    # micro-batch's pending receive, so one transfer is in flight at a time.
+    SGLANG_PROTO_ASYNCLL_PEER_RECV_FIRST = EnvBool(False)
     # MXFP4 trtllm-gen MoE: deferred-finalize calls above 32 rows pass the finalized
     # output shape, so they hit FlashInfer's tuned tactics (off: only 97-384 rows do).
     SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE = EnvBool(
