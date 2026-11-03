@@ -1747,9 +1747,10 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
 
 
 class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
-    """MORI EPv2 on its AsyncLL send/recv kernels. With ``overlap`` each send runs
-    in *_a and its receive in *_b, so a TBO sibling batch computes while the
-    transfer drains; without it the receive follows the send at once."""
+    """MORI EPv2 on its AsyncLL send/recv kernels. With ``overlap``, or inside a
+    TBO micro-batch, each send runs in *_a and its receive in *_b, so a TBO
+    sibling batch computes while the transfer drains; otherwise the receive
+    follows the send at once."""
 
     def __init__(self, overlap: bool, async_finish: bool, **kwargs):
         super().__init__(async_finish=async_finish, **kwargs)
@@ -1757,6 +1758,8 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         # Send halves in flight, completed by dispatch_b / combine_b.
         self._pending_dispatch = None
         self._pending_combine = None
+        # The receive a send left for *_b, if any.
+        self._deferred_recv = None
 
     @property
     def _uses_async_ll(self) -> bool:
@@ -1770,8 +1773,7 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         self._pending_dispatch = self.mori_op.dispatch_send(
             hidden_states, topk_weights, scale, topk_ids, return_routing=True
         )
-        if not self._overlap:
-            self.mori_op.dispatch_recv()
+        self._receive_or_defer(self.mori_op.dispatch_recv)
         return state
 
     def _dispatch_transport(
@@ -1780,8 +1782,7 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         result = self._pending_dispatch
         self._pending_dispatch = None
         assert result is not None, "MORI EPv2 AsyncLL dispatch_b without dispatch_a"
-        if self._overlap:
-            self.mori_op.dispatch_recv()
+        self._run_deferred_recv()
         return result
 
     def combine_a(
@@ -1795,17 +1796,28 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         self._pending_combine, _ = self.mori_op.combine_send(
             hidden_states, None, self._recv_topk_ids, routing=self._routing
         )
-        if not self._overlap:
-            self.mori_op.combine_recv()
+        self._receive_or_defer(self.mori_op.combine_recv)
         return state
 
     def _combine_transport(self, hidden_states, topk_ids, topk_weights, ready_event):
         out = self._pending_combine
         self._pending_combine = None
         assert out is not None, "MORI EPv2 AsyncLL combine_b without combine_a"
-        if self._overlap:
-            self.mori_op.combine_recv()
+        self._run_deferred_recv()
         return out
+
+    def _receive_or_defer(self, recv) -> None:
+        # Only a TBO micro-batch has a sibling to compute while the transfer drains;
+        # normal + SDMA enters AsyncLL without overlap, yet TBO still splits it.
+        if self._overlap or self._in_tbo_subbatch:
+            self._deferred_recv = recv
+        else:
+            recv()
+
+    def _run_deferred_recv(self) -> None:
+        recv, self._deferred_recv = self._deferred_recv, None
+        if recv is not None:
+            recv()
 
 
 class _Stage(Enum):
