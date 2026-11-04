@@ -1792,6 +1792,9 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
         return out
 
 
+_GAP_STRIDE_LOGGED = [0]
+
+
 class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
     """MORI EPv2 on its AsyncLL send/recv kernels. With ``overlap`` each send runs
     in *_a and its receive in *_b, so a TBO sibling batch computes while the
@@ -1803,18 +1806,53 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         # Send halves in flight, completed by dispatch_b / combine_b.
         self._pending_dispatch = None
         self._pending_combine = None
+        # Experiment only: TBO micro-batches use MORI's gapped layout, where the
+        # expert reads the SDMA landing area in place (dispatch_send(gap_stride=)).
+        self._gapped = get_bool_env_var("SGLANG_EXP_MORI_ASYNCLL_GAPPED", "false")
+        self._gap_stride = 0
 
     @property
     def _uses_async_ll(self) -> bool:
         return True
+
+    def _select_gap_stride(self) -> int:
+        """Per-source rows of this round's gapped layout, 0 for the packed one.
+
+        Every rank must agree, so it depends only on the micro-batch's per-rank
+        token counts, which TBO gathers on the host before splitting.
+        """
+        if not self._gapped or not self._in_tbo_subbatch:
+            return 0
+        rows = self._dispatch_sender_rows
+        if rows is None or get_parallel().attn_tp_size != 1:
+            return 0
+        stride = max(max(rows), 1)
+        if _GAP_STRIDE_LOGGED[0] < 8:
+            _GAP_STRIDE_LOGGED[0] += 1
+            logger.info(f"MORI gapped layout: stride {stride} from micro-batch rows {rows}")
+        if self._num_tokens > stride:
+            raise RuntimeError(
+                f"MORI gapped layout: {self._num_tokens} local tokens exceed the "
+                f"micro-batch bound {stride} (rows {rows})"
+            )
+        return stride
+
+    def _select_recv_cap(self) -> int:
+        if self._gap_stride:
+            # The gapped view's rows are the layout itself, not a bound to trim to.
+            self._recv_cap = 0
+            return 0
+        return super()._select_recv_cap()
 
     def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         state = super().dispatch_a(hidden_states, topk_output)
         # The returned views are valid only after dispatch_recv; the inputs stay
         # alive in `state` until then.
         hidden_states, topk_weights, topk_ids, scale = state[:4]
+        self._gap_stride = self._select_gap_stride()
+        gap = {"gap_stride": self._gap_stride} if self._gap_stride else {}
         self._pending_dispatch = self.mori_op.dispatch_send(
-            hidden_states, topk_weights, scale, topk_ids, return_routing=True
+            hidden_states, topk_weights, scale, topk_ids, return_routing=True, **gap
         )
         if not self._overlap:
             self.mori_op.dispatch_recv()
