@@ -573,6 +573,10 @@ def _pre_permute_deepep_to_aiter(
 
         a1_scale = dispatch_output.hidden_states_scale
         num_local_tokens = dispatch_output.num_recv_tokens_per_expert
+        if getattr(dispatch_output, "zero_copy", False):
+            # Per-source segments, empty rows masked by expert_mask: every row is
+            # an input, there is no compact prefix to bound.
+            num_local_tokens = None
         output_dtype = dispatch_output.out_dtype
         output = getattr(dispatch_output, "expert_output", None)
         mori_max = dispatch_output.recv_cap
