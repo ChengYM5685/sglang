@@ -4,6 +4,7 @@ The MORI op is a fake that logs its calls, so these pin which calls each mode
 makes and when, not what the kernels compute.
 """
 
+import inspect
 import os
 import sys
 import unittest
@@ -44,10 +45,11 @@ def _fake_mori_modules():
 
 
 class _FakeOp:
-    def __init__(self, log):
+    def __init__(self, log, tag="", is_internode=False):
         self.log = log
+        self.tag = tag
         self.cfg = SimpleNamespace(
-            effective_max_recv=64, is_internode=False, is_scatter=False
+            effective_max_recv=64, is_internode=is_internode, is_scatter=False
         )
         self.backend_name = "hip"
         self.dispatched = None
@@ -65,28 +67,28 @@ class _FakeOp:
         return self.dispatched
 
     def dispatch(self, hidden, weights, scales, indices, **kwargs):
-        self.log.append("dispatch")
+        self.log.append(self.tag + "dispatch")
         return self._dispatch_result(hidden, weights, indices)
 
     def dispatch_send(self, hidden, weights, scales, indices, return_routing):
-        self.log.append("dispatch_send")
+        self.log.append(self.tag + "dispatch_send")
         return self._dispatch_result(hidden, weights, indices)
 
     def dispatch_recv(self):
-        self.log.append("dispatch_recv")
+        self.log.append(self.tag + "dispatch_recv")
 
     def combine(self, hidden, weights, indices, routing):
-        self.log.append("combine")
+        self.log.append(self.tag + "combine")
         self.combined = hidden.clone()
         return self.combined, None
 
     def combine_send(self, hidden, weights, indices, routing):
-        self.log.append("combine_send")
+        self.log.append(self.tag + "combine_send")
         self.combined = hidden.clone()
         return self.combined, None
 
     def combine_recv(self):
-        self.log.append("combine_recv")
+        self.log.append(self.tag + "combine_recv")
 
 
 class _MoriEPv2TestCase(CustomTestCase):
@@ -113,7 +115,7 @@ class _MoriEPv2TestCase(CustomTestCase):
             item.stop()
         reset_context()
 
-    def _make_dispatcher(self, deepep_mode, async_finish=False):
+    def _make_dispatcher(self, deepep_mode, async_finish=False, instance_id=0):
         dispatcher = MoriEPDispatcher(
             group=None,
             router_topk=_TOPK,
@@ -121,6 +123,7 @@ class _MoriEPv2TestCase(CustomTestCase):
             params_dtype=torch.bfloat16,
             deepep_mode=deepep_mode,
             async_finish=async_finish,
+            instance_id=instance_id,
         )
         dispatcher._get_impl()._mori_op = _FakeOp(self.log)
         return dispatcher
@@ -280,6 +283,143 @@ class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
             (dispatched.hidden_states, dispatched.topk_ids, dispatched.topk_weights)
         )
         self.assertEqual(self.log, ["dispatch", "combine"])
+
+
+_CAPPED = moriep._MoriEPv2LaunchConfig(32, 4, 48, 4)
+_DEFAULT = moriep._MoriEPv2LaunchConfig(None, None, None, None)
+
+
+class TestMoriEPv2OpPlans(CustomTestCase):
+    """Under TBO only native micro-batches take the capped grid; unsplit forwards
+    get MORI's default grid from an op of their own, on instance 0 only."""
+
+    @staticmethod
+    def _plans(**kwargs):
+        plans = moriep._get_epv2_op_plans(**kwargs)
+        return tuple(None if p is None else (p.purpose, p.launch_config) for p in plans)
+
+    def test_plans(self):
+        shared = "TBO micro-batches and unsplit forwards"
+        cases = [
+            # (tbo_enabled, async_ll, instance_id, flag), main plan, unsplit plan
+            ((False, False, 0, True), ("all forwards", _DEFAULT), None),
+            ((False, True, 0, True), ("all forwards", _DEFAULT), None),
+            ((True, True, 0, True), (shared, _DEFAULT), None),
+            (
+                (True, False, 0, True),
+                ("TBO micro-batches", _CAPPED),
+                ("unsplit forwards", _DEFAULT),
+            ),
+            ((True, False, 1, True), ("TBO micro-batches", _CAPPED), None),
+            ((True, False, 0, False), (shared, _CAPPED), None),
+            ((True, False, 1, False), (shared, _CAPPED), None),
+        ]
+        for (tbo, async_ll, instance_id, flag), main, unsplit in cases:
+            with (
+                self.subTest(
+                    tbo=tbo, async_ll=async_ll, instance=instance_id, flag=flag
+                ),
+                envs.SGLANG_OPT_MORI_TBO_CAP_ONLY_MICRO_BATCHES.override(flag),
+            ):
+                self.assertEqual(
+                    self._plans(
+                        tbo_enabled=tbo, async_ll=async_ll, instance_id=instance_id
+                    ),
+                    (main, unsplit),
+                )
+
+
+class TestMoriEPv2UnsplitOp(_MoriEPv2TestCase):
+    """The op a forward runs on follows whether it is a TBO micro-batch, from
+    dispatch through combine."""
+
+    def _build(self, tbo=True, instance_id=0, internode=False):
+        """Return the dispatcher and the (instance_id, purpose, launch_config) of
+        each op it built."""
+        signature = inspect.signature(moriep.init_mori_epv2_op)
+        built = []
+
+        def fake_init(*args):
+            bound = signature.bind(*args).arguments
+            built.append(
+                (bound["instance_id"], bound["purpose"], bound["launch_config"])
+            )
+            return _FakeOp(self.log, tag=f"{bound['purpose']}:", is_internode=internode)
+
+        with (
+            get_flags().moe.override(tbo_enabled=tbo),
+            patch.object(moriep, "init_mori_epv2_op", side_effect=fake_init),
+        ):
+            dispatcher = self._make_dispatcher(
+                DeepEPMode.NORMAL, instance_id=instance_id
+            )
+            impl = dispatcher._get_impl()
+            impl._mori_op = None
+            impl._initialize_op()
+        return dispatcher, built
+
+    def _round_trip(self, dispatcher, micro_batch: bool):
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        del self.log[:]
+        with forward_context(
+            ForwardContext(attn_backend=None, is_micro_batch=micro_batch)
+        ):
+            dispatched = dispatcher.dispatch(*self._inputs())
+            dispatcher.combine(
+                (dispatched.hidden_states, dispatched.topk_ids, dispatched.topk_weights)
+            )
+        return list(self.log)
+
+    def test_tbo_instance_0_runs_unsplit_forwards_uncapped(self):
+        dispatcher, built = self._build()
+        self.assertEqual(
+            built,
+            [(0, "TBO micro-batches", _CAPPED), (0, "unsplit forwards", _DEFAULT)],
+        )
+        self.assertEqual(
+            self._round_trip(dispatcher, micro_batch=False),
+            ["unsplit forwards:dispatch", "unsplit forwards:combine"],
+        )
+        self.assertEqual(
+            self._round_trip(dispatcher, micro_batch=True),
+            ["TBO micro-batches:dispatch", "TBO micro-batches:combine"],
+        )
+
+    def test_opt_out_keeps_one_capped_op(self):
+        shared = "TBO micro-batches and unsplit forwards"
+        with envs.SGLANG_OPT_MORI_TBO_CAP_ONLY_MICRO_BATCHES.override(False):
+            dispatcher, built = self._build()
+        self.assertEqual(built, [(0, shared, _CAPPED)])
+        for micro_batch in (False, True):
+            self.assertEqual(
+                self._round_trip(dispatcher, micro_batch=micro_batch),
+                [f"{shared}:dispatch", f"{shared}:combine"],
+            )
+
+    def test_only_instance_0_builds_an_unsplit_op(self):
+        _, built = self._build(instance_id=1)
+        self.assertEqual(built, [(1, "TBO micro-batches", _CAPPED)])
+
+    def test_internode_op_serves_all_forwards(self):
+        # The internode path ignores the launch config, so a second op buys nothing.
+        dispatcher, built = self._build(internode=True)
+        self.assertEqual(built, [(0, "TBO micro-batches", _CAPPED)])
+        self.assertEqual(
+            self._round_trip(dispatcher, micro_batch=False),
+            ["TBO micro-batches:dispatch", "TBO micro-batches:combine"],
+        )
+
+    def test_without_tbo_one_default_op(self):
+        dispatcher, built = self._build(tbo=False)
+        self.assertEqual(built, [(0, "all forwards", _DEFAULT)])
+        self.assertEqual(
+            self._round_trip(dispatcher, micro_batch=False),
+            ["all forwards:dispatch", "all forwards:combine"],
+        )
 
 
 if __name__ == "__main__":

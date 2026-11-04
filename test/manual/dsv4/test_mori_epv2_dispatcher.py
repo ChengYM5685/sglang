@@ -2,7 +2,9 @@
 
 TBO=1 runs the FP4-asymmetric two-child TBO path instead; there TEST_CUDA_GRAPH=1
 captures and replays REPLAY_ITERS times (default 3), with each child writing its
-expert output directly into its own combine staging view.
+expert output directly into its own combine staging view. An eager forward TBO
+did not split follows, on instance 0's uncapped op (one capped op shared by all
+forwards with SGLANG_OPT_MORI_TBO_CAP_ONLY_MICRO_BATCHES=0).
 MODE=low_latency (default normal) or MORI_ENABLE_SDMA=1 runs either path on the
 AsyncLL send/recv kernels, which dispatch fp4 as MXFP8 (bf16 on gfx1250 or
 older AITER) and combine in bf16.
@@ -24,6 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.moriep import round_logical_recv_rows
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_flags
 
 
@@ -386,15 +389,36 @@ def _run_tbo(rank, world_size):
     children = [child._get_impl() for child in dispatcher._inners]
     async_ll = children[0]._uses_async_ll
     assert children[0]._comm_stream is children[1]._comm_stream
+    capped = adapter._MoriEPv2LaunchConfig(32, 4, 48, 4)
+    cap_only_micro_batches = envs.SGLANG_OPT_MORI_TBO_CAP_ONLY_MICRO_BATCHES.get()
     if async_ll:
         # The send halves return at once; MORI sizes the AsyncLL grids itself.
         assert children[0]._comm_stream is None
-        assert children[0]._launch_config == adapter._get_epv2_launch_config(False)
+        default = adapter._get_epv2_launch_config(False)
+        assert children[0]._op_plan.launch_config == default
+        assert children[0]._unsplit_mori_op is None
     else:
-        assert children[0]._launch_config == adapter._MoriEPv2LaunchConfig(32, 4, 48, 4)
+        assert children[0]._op_plan.launch_config == capped
+        # Only instance 0 runs unsplit forwards, on an uncapped op of its own.
+        assert (children[0]._unsplit_mori_op is not None) == cap_only_micro_batches
+    assert children[1]._unsplit_mori_op is None
     dispatch = children[0].dispatch_dtype.name
     assert dispatch == (_async_ll_fp4_dispatch() if async_ll else "fp4"), dispatch
-    assert children[0].mori_op is not children[1].mori_op
+    assert children[0]._mori_op is not children[1]._mori_op
+    unsplit_op = children[0]._unsplit_mori_op
+    if unsplit_op is None:
+        unsplit_op = children[0]._mori_op
+    assert unsplit_op is not children[1]._mori_op
+
+    def child_ctx(child_id):
+        # As _StageExecutor runs a TBO child's stages: marked, bounded by its rows.
+        return forward_context(
+            ForwardContext(
+                attn_backend=None,
+                is_micro_batch=True,
+                dp_global_num_tokens_bound=list(child_token_counts[child_id]),
+            )
+        )
 
     fp4_lookup = _fp4_lookup()
     failures = torch.zeros(1, dtype=torch.int32)
@@ -429,36 +453,20 @@ def _run_tbo(rank, world_size):
             dp_attention.set_dp_buffer_len(
                 sum(token_counts), token_counts[rank], False, list(token_counts)
             )
-            dispatcher.dispatch_a(
-                tbo_subbatch_index=child_id,
-                hidden_states=hidden,
-                topk_output=topk_output,
-            )
-        outputs = [
-            dispatcher.dispatch_b(tbo_subbatch_index=child_id) for child_id in range(2)
-        ]
+            with child_ctx(child_id):
+                dispatcher.dispatch_a(
+                    tbo_subbatch_index=child_id,
+                    hidden_states=hidden,
+                    topk_output=topk_output,
+                )
+        outputs = []
+        for child_id in range(2):
+            with child_ctx(child_id):
+                outputs.append(dispatcher.dispatch_b(tbo_subbatch_index=child_id))
         direct_views = []
         for child_id, (child, output) in enumerate(zip(children, outputs)):
-            if child._manual_recv_cap > 0:
-                assert output.recv_cap == min(
-                    child._manual_recv_cap, child.mori_op.cfg.effective_max_recv
-                )
-            elif child._trim_recv and child._is_recv_layout_verified():
-                expected_cap = round_logical_recv_rows(
-                    sum(child_token_counts[child_id]),
-                    pow2_buckets=child._recv_cap_pow2_buckets,
-                )
-                assert output.recv_cap == expected_cap
-            else:
-                assert output.recv_cap == 0
-            expected_direct = callable(getattr(child.mori_op, "combine_in_view", None))
-            assert (output.expert_output is not None) == expected_direct
-            if output.expert_output is not None:
-                assert (
-                    output.expert_output.data_ptr()
-                    == child.mori_op.combine_in_view().data_ptr()
-                )
-                direct_views.append(output.expert_output.data_ptr())
+            with child_ctx(child_id):
+                direct_views += check_dispatch_output(child_id, child, output)
         assert len(direct_views) == len(set(direct_views)), (
             "TBO children share an output buffer"
         )
@@ -468,17 +476,43 @@ def _run_tbo(rank, world_size):
                 direct_out = output.expert_output[: expert_out.shape[0]]
                 direct_out.copy_(expert_out)
                 expert_out = direct_out
-            dispatcher.combine_a(
-                tbo_subbatch_index=child_id,
-                combine_input=(expert_out, output.topk_ids, output.topk_weights),
-            )
-        actual = [
-            dispatcher.combine_b(tbo_subbatch_index=child_id)[
-                : inputs[child_id][0].shape[0]
-            ]
-            for child_id in range(2)
-        ]
+            with child_ctx(child_id):
+                dispatcher.combine_a(
+                    tbo_subbatch_index=child_id,
+                    combine_input=(expert_out, output.topk_ids, output.topk_weights),
+                )
+        actual = []
+        for child_id in range(2):
+            with child_ctx(child_id):
+                combined = dispatcher.combine_b(tbo_subbatch_index=child_id)
+            actual.append(combined[: inputs[child_id][0].shape[0]])
         return actual, outputs
+
+    def check_dispatch_output(child_id, child, output):
+        """Return the direct-output pointer the child handed its expert, if any."""
+        if child._manual_recv_cap > 0:
+            assert output.recv_cap == min(
+                child._manual_recv_cap, child.mori_op.cfg.effective_max_recv
+            )
+        elif child._trim_recv and child._is_recv_layout_verified():
+            expected_cap = round_logical_recv_rows(
+                sum(child_token_counts[child_id]),
+                pow2_buckets=child._recv_cap_pow2_buckets,
+            )
+            assert output.recv_cap == expected_cap
+        else:
+            assert output.recv_cap == 0
+        # A micro-batch runs on its instance's TBO op, never the unsplit one.
+        assert child.mori_op is child._mori_op
+        expected_direct = callable(getattr(child.mori_op, "combine_in_view", None))
+        assert (output.expert_output is not None) == expected_direct
+        if output.expert_output is None:
+            return []
+        assert (
+            output.expert_output.data_ptr()
+            == child.mori_op.combine_in_view().data_ptr()
+        )
+        return [output.expert_output.data_ptr()]
 
     def check(actual, atol=0.6, rtol=0.6):
         torch.cuda.synchronize()
@@ -495,6 +529,41 @@ def _run_tbo(rank, world_size):
                 rtol=rtol,
             ):
                 failures.add_(1)
+
+    def run_unsplit_step():
+        """Run child 0's rows as one forward TBO did not split; return its recv cap."""
+        hidden, ids, topk_output = inputs[0]
+        token_counts = child_token_counts[0]
+        dp_attention.set_dp_buffer_len(
+            sum(token_counts), token_counts[rank], False, list(token_counts)
+        )
+        assert children[0].mori_op is unsplit_op
+        output = dispatcher.dispatch(hidden_states=hidden, topk_output=topk_output)
+        expert_out = _expert_output(output, dispatch, fp4_lookup)
+        if output.expert_output is not None:
+            assert (
+                output.expert_output.data_ptr()
+                == unsplit_op.combine_in_view().data_ptr()
+            )
+            direct_out = output.expert_output[: expert_out.shape[0]]
+            direct_out.copy_(expert_out)
+            expert_out = direct_out
+        combined = dispatcher.combine(
+            combine_input=(expert_out, output.topk_ids, output.topk_weights)
+        )
+        torch.cuda.synchronize()
+        expected = (
+            (
+                _expected_unique_destinations(ids, experts_per_rank)
+                * hidden.float().cpu()
+            )
+            .to(torch.bfloat16)
+            .float()
+        )
+        # The replays left powers of two in the inputs, exact in FP4.
+        if not torch.allclose(combined.float().cpu(), expected, atol=2e-2, rtol=2e-2):
+            failures.add_(1)
+        return output.recv_cap
 
     replay_iters = int(os.environ.get("REPLAY_ITERS", "3"))
     assert replay_iters > 0
@@ -523,6 +592,7 @@ def _run_tbo(rank, world_size):
             graph.replay()
         check(actual, atol=2e-2, rtol=2e-2)
     graph = None
+    unsplit_recv_cap = run_unsplit_step()
     torch.cuda.synchronize()
     dist.all_reduce(failures)
     if rank == 0:
@@ -534,6 +604,10 @@ def _run_tbo(rank, world_size):
             "async_ll": async_ll,
             "replay_iters": replay_iters,
             "recv_caps": [output.recv_cap for output in outputs],
+            "unsplit_op": (
+                "own" if children[0]._unsplit_mori_op is not None else "shared"
+            ),
+            "unsplit_recv_cap": unsplit_recv_cap,
             "child_sender_rows": child_token_counts,
             "failures": failures.item(),
         }
@@ -543,9 +617,11 @@ def _run_tbo(rank, world_size):
         )
         if result_json := os.environ.get("RESULT_JSON"):
             Path(result_json).write_text(json.dumps(summary, indent=2) + "\n")
-    for child in children:
-        child.mori_op.close()
-        child.mori_op.comm.destroy()
+    ops = [children[0]._mori_op, children[1]._mori_op, children[0]._unsplit_mori_op]
+    for op in ops:
+        if op is not None:
+            op.close()
+            op.comm.destroy()
     dist.destroy_process_group()
     raise SystemExit(int(failures.item() != 0))
 

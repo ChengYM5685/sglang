@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
+import msgspec
+
 from sglang.srt.arg_groups.moe_hook import mori_max_dispatch_tokens_per_rank
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
@@ -350,6 +352,34 @@ def _get_epv2_launch_config(tbo_enabled: bool) -> _MoriEPv2LaunchConfig:
     )
 
 
+class _MoriEPv2OpPlan(msgspec.Struct, frozen=True):
+    # The forwards the op serves, for the init log.
+    purpose: str
+    launch_config: _MoriEPv2LaunchConfig
+
+
+def _get_epv2_op_plans(
+    tbo_enabled: bool, async_ll: bool, instance_id: int
+) -> tuple[_MoriEPv2OpPlan, Optional[_MoriEPv2OpPlan]]:
+    """Plan a dispatcher's op and, if unsplit forwards need their own, that op."""
+    default = _get_epv2_launch_config(False)
+    if not tbo_enabled:
+        return _MoriEPv2OpPlan("all forwards", default), None
+    shared = "TBO micro-batches and unsplit forwards"
+    # Under SDMA or low_latency MORI derives its grids from the CU count, so keep
+    # its geometry.
+    if async_ll:
+        return _MoriEPv2OpPlan(shared, default), None
+    capped = _get_epv2_launch_config(True)
+    if not envs.SGLANG_OPT_MORI_TBO_CAP_ONLY_MICRO_BATCHES.get():
+        return _MoriEPv2OpPlan(shared, capped), None
+    micro_batches = _MoriEPv2OpPlan("TBO micro-batches", capped)
+    # MaybeTboDeepEPDispatcher runs every unsplit forward on instance 0.
+    if instance_id != 0:
+        return micro_batches, None
+    return micro_batches, _MoriEPv2OpPlan("unsplit forwards", default)
+
+
 # init_mori_op only needs do once in model initial stage
 # use lru_cache to reuse the same mori_op instance to avoid the init overhead for mori
 @lru_cache(maxsize=4)
@@ -655,6 +685,7 @@ def init_mori_epv2_op(
     launch_config: _MoriEPv2LaunchConfig = _MoriEPv2LaunchConfig(
         None, None, None, None
     ),
+    purpose: str = "all forwards",
 ):
     from mori.ops.dispatch_combine_v2 import (
         EpDispatchCombineConfig,
@@ -753,7 +784,10 @@ def init_mori_epv2_op(
             op.prepare_recv_cap(cap)
             cap *= 2
     logger.info(
-        f"[MORI EPv2 init] world={world_size} rank={rank} lsa_size={lsa_size} "
+        f"[MORI EPv2 init] op for {purpose}: instance={instance_id} "
+        f"dispatch_blocks={cfg.dispatch_block_num}x{cfg.warp_num_per_block}w "
+        f"combine_blocks={cfg.combine_block_num}x{cfg.combine_warp_num_per_block}w "
+        f"world={world_size} rank={rank} lsa_size={lsa_size} "
         f"hidden={hidden_size} experts={num_experts} local_experts={num_local_experts} "
         f"topk={router_topk} max_tokens={num_max_dispatch_tokens_per_rank} "
         f"recv_cap={cfg.effective_max_recv} "
@@ -1480,12 +1514,14 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
         os.environ.setdefault("AITER_FLYDSL_EP_NO_FAKE_EXPERT", "1")
         self.async_finish = async_finish
         self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")
-        # Under SDMA or low_latency MORI derives its grids from the CU count, so
-        # keep its geometry.
-        self._launch_config = _get_epv2_launch_config(
-            self._tbo_enabled and not self._uses_async_ll
+        self._op_plan, self._unsplit_op_plan = _get_epv2_op_plans(
+            tbo_enabled=self._tbo_enabled,
+            async_ll=self._uses_async_ll,
+            instance_id=self.instance_id,
         )
         self._mori_op = None
+        # None while _mori_op also serves the forwards TBO did not split.
+        self._unsplit_mori_op = None
         self.fp8_quant_func = None
         self.fp4_quant_func = None
         self.mxfp8_quant_func = None
@@ -1586,7 +1622,21 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
     def _initialize_op(self):
         # set_quant_config runs during model loading, before CUDA graph capture,
         # so collective CCO window creation and graph-tier JIT happen safely.
-        self._mori_op = init_mori_epv2_op(
+        self._mori_op = self._build_op(self._op_plan)
+        if self._unsplit_op_plan is not None:
+            # Older MORI builds have no internode path.
+            if getattr(self._mori_op.cfg, "is_internode", False):
+                logger.info_once(
+                    "[MORI EPv2 init] internode ops ignore the launch config; the "
+                    "TBO micro-batch op also serves unsplit forwards."
+                )
+            else:
+                self._unsplit_mori_op = self._build_op(self._unsplit_op_plan)
+        # Keep logical caps on the power-of-two ladder init_mori_epv2_op pre-compiled.
+        self._recv_cap_pow2_buckets = _supports_dynamic_recv_cap(self._mori_op)
+
+    def _build_op(self, plan: _MoriEPv2OpPlan):
+        return init_mori_epv2_op(
             self.group,
             self.router_topk,
             self.num_experts,
@@ -1600,10 +1650,9 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
             self.combine_dtype,
             self.enable_sdma,
             envs.SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS.get(),
-            self._launch_config,
+            plan.launch_config,
+            plan.purpose,
         )
-        # Keep logical caps on the power-of-two ladder init_mori_epv2_op pre-compiled.
-        self._recv_cap_pow2_buckets = _supports_dynamic_recv_cap(self._mori_op)
 
     @property
     def mori_op(self):
@@ -1614,6 +1663,10 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
                 "allocated after KV cache sizing."
             )
             self._initialize_op()
+        # A forward's stages are all micro-batch or all not, so its dispatch and
+        # combine stay on one op; CUDA graphs bake in the op picked at capture.
+        if self._unsplit_mori_op is not None and not self._in_tbo_subbatch:
+            return self._unsplit_mori_op
         return self._mori_op
 
     def _get_physical_recv_rows(self) -> int:

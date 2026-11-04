@@ -986,6 +986,9 @@ class Envs:
     SGLANG_MORI_DISPATCH_DTYPE = EnvStr("auto")
     SGLANG_MORI_COMBINE_DTYPE = EnvStr("auto")
     SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS = EnvInt(0)
+    # Under TBO, cap the native EPv2 grid only for TBO micro-batches; forwards TBO
+    # leaves whole use an uncapped op, which costs one more EPv2 arena per rank.
+    SGLANG_OPT_MORI_TBO_CAP_ONLY_MICRO_BATCHES = EnvBool(True)
     # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
     # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.
     SGLANG_MORI_RECV_BOUND = EnvBool(False)
