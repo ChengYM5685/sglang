@@ -1792,7 +1792,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
         return out
 
 
-_GAP_STRIDE_LOGGED = [0]
+_GAP_STRIDES_LOGGED = set()
 
 
 class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
@@ -1827,8 +1827,8 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         if rows is None or get_parallel().attn_tp_size != 1:
             return 0
         stride = max(max(rows), 1)
-        if _GAP_STRIDE_LOGGED[0] < 8:
-            _GAP_STRIDE_LOGGED[0] += 1
+        if stride not in _GAP_STRIDES_LOGGED and len(_GAP_STRIDES_LOGGED) < 16:
+            _GAP_STRIDES_LOGGED.add(stride)
             logger.info(f"MORI gapped layout: stride {stride} from micro-batch rows {rows}")
         if self._num_tokens > stride:
             raise RuntimeError(
