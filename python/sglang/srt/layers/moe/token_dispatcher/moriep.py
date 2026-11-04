@@ -1823,6 +1823,9 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         """
         if not self._gapped or not self._in_tbo_subbatch:
             return 0
+        # Captured (decode) graphs keep the packed layout; the stride is a host value.
+        if torch.cuda.is_current_stream_capturing():
+            return 0
         rows = self._dispatch_sender_rows
         if rows is None or get_parallel().attn_tp_size != 1:
             return 0
