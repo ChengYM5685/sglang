@@ -330,7 +330,7 @@ class AiterRunnerCore(MoeRunnerCore):
         if activation is None:
             activation = _aiter_activation(self.config)
 
-        output = fused_moe(
+        fused_moe_kwargs = dict(
             hidden_states=runner_input.hidden_states,
             w1=quant_info.w13_weight,
             w2=quant_info.w2_weight,
@@ -350,6 +350,11 @@ class AiterRunnerCore(MoeRunnerCore):
             intermediate_pad=quant_info.intermediate_pad,
             **extra,
         )
+        # Experiment only: dump a few MORI calls for the gapped-layout benchmark.
+        from sglang.srt.layers.moe.moe_runner import exp_gapmoe_dump
+
+        exp_gapmoe_dump.maybe_dump(fused_moe_kwargs)
+        output = fused_moe(**fused_moe_kwargs)
         return AiterRunnerOutput(hidden_states=output)
 
     @property
