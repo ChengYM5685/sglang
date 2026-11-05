@@ -234,19 +234,6 @@ class ToolStrictLevel(IntEnum):
     PARAMETER = 2
 
 
-class MoriAsyncLLZeroCopy(IntEnum):
-    """MORI EPv2 AsyncLL (SDMA) zero copy for prefill (MORI async_ll_zero_copy).
-
-    OFF: the MoE reads MORI's compact receive copy
-    DISPATCH: the MoE reads the per-source landing segments in place
-    FULL: DISPATCH, and combine also sends straight from the MoE output
-    """
-
-    OFF = 0
-    DISPATCH = 1
-    FULL = 2
-
-
 class InvariantCheckLevel(IntEnum):
     """Signal level for value/index validity checks (see invariants.py).
 
@@ -1009,9 +996,6 @@ class Envs:
     )
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
-    # EPv2 AsyncLL (SDMA) prefill zero copy, MoriAsyncLLZeroCopy; needs a MORI build
-    # with EpDispatchCombineConfig.async_ll_zero_copy.
-    SGLANG_OPT_MORI_ASYNCLL_ZERO_COPY = EnvInt(MoriAsyncLLZeroCopy.OFF)
 
     # ===================================================================
     # AMD, ROCm, and AITER

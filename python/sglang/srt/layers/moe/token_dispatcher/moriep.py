@@ -118,8 +118,16 @@ def mori_recv_bound(
     return sum(sender_rows)
 
 
-# Op instances that already logged their first zero-copy dispatch.
+# Op instances that already logged their first zero-copy dispatch / fallback.
 _zero_copy_logged: set[int] = set()
+_zero_copy_fallback_logged: set[int] = set()
+
+# Most rows a zero-copy dispatch may hand the MoE, relative to the rows it really
+# carries: the stride is the largest rank's rows, so uneven ranks pad the others.
+# Arbitrary first cut from the gapmoe microbenchmark (handoff
+# 2026-11-04-epv2-gapped-moe-bench): ~1.06x cost nothing and 2x lost the whole
+# gain at 8192 rows per source; re-tune with an uneven sweep.
+ZERO_COPY_MAX_ROW_INFLATION = 1.25
 
 
 def zero_copy_rows_per_rank(sender_rows: Optional[tuple[int, ...]]) -> int:
@@ -139,6 +147,12 @@ def zero_copy_rows_per_rank(sender_rows: Optional[tuple[int, ...]]) -> int:
     ):
         return 0
     return -(-max(sender_rows) // parallel.attn_tp_size)
+
+
+def zero_copy_rows_fit(*, stride: int, ep_size: int, total_rows: int) -> bool:
+    """Whether a zero-copy dispatch's ep_size * stride MoE rows stay within
+    ZERO_COPY_MAX_ROW_INFLATION of the total_rows every rank sends."""
+    return 0 < total_rows and ep_size * stride <= ZERO_COPY_MAX_ROW_INFLATION * total_rows
 
 
 def _max_dispatch_tokens_per_rank() -> int:
@@ -740,22 +754,15 @@ def init_mori_epv2_op(
         cfg_fields = EpDispatchCombineConfig.__dataclass_fields__
         if async_ll_transport == "sdma" and "async_ll_own_sdma_queue" in cfg_fields:
             cfg_kwargs.update(async_ll_own_sdma_queue=True)
-        zero_copy = int(envs.SGLANG_OPT_MORI_ASYNCLL_ZERO_COPY.get())
-        # fp8/fp4 dispatch can be dequantized before the MoE, which bounds its
-        # rows by the compact receive count that zero copy does not produce.
-        if zero_copy and (
-            async_ll_transport != "sdma"
-            or "async_ll_zero_copy" not in cfg_fields
-            or dispatch_dtype not in (DispatchDtype.bf16, DispatchDtype.mxfp8)
+        # Zero copy needs no switch: "auto" lets MORI turn it on only where this
+        # op's config supports it. fp8/fp4 dispatch can be dequantized before the
+        # MoE, which bounds its rows by the compact receive count zero copy lacks.
+        if (
+            async_ll_transport == "sdma"
+            and "async_ll_zero_copy" in cfg_fields
+            and dispatch_dtype in (DispatchDtype.bf16, DispatchDtype.mxfp8)
         ):
-            logger.warning_once(
-                "SGLANG_OPT_MORI_ASYNCLL_ZERO_COPY needs the SDMA transport, bf16 or "
-                "mxfp8 dispatch and a MORI build with async_ll_zero_copy; keeping "
-                f"MORI's compact receive (dispatch_dtype={dispatch_dtype})."
-            )
-            zero_copy = 0
-        if zero_copy:
-            cfg_kwargs.update(async_ll_zero_copy=zero_copy)
+            cfg_kwargs.update(async_ll_zero_copy="auto")
     cfg = EpDispatchCombineConfig(
         **cfg_kwargs,
         # Only the hip backend has the AsyncLL kernels; gfx950 defaults to flydsl,
@@ -806,7 +813,7 @@ def init_mori_epv2_op(
         + (f" async_ll_transport={async_ll_transport}" if async_ll else "")
         + (
             f" own_sdma_queue={cfg_kwargs.get('async_ll_own_sdma_queue', False)}"
-            f" zero_copy={cfg_kwargs.get('async_ll_zero_copy', 0)}"
+            f" zero_copy={getattr(op.cfg, 'async_ll_zero_copy', False)}"
             if async_ll
             else ""
         )
@@ -1890,6 +1897,17 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
             round_logical_recv_rows(rows_per_rank, pow2_buckets=False),
             cfg.effective_max_recv_per_rank,
         )
+        total_rows = sum(self._dispatch_sender_rows)
+        ep_size = get_parallel().moe_ep_size
+        if not zero_copy_rows_fit(stride=stride, ep_size=ep_size, total_rows=total_rows):
+            if self.instance_id not in _zero_copy_fallback_logged:
+                _zero_copy_fallback_logged.add(self.instance_id)
+                logger.info(
+                    f"[MORI EPv2] AsyncLL zero copy skipped for uneven rows: "
+                    f"instance={self.instance_id} stride={stride} "
+                    f"rows={self._dispatch_sender_rows}"
+                )
+            return 0
         if self._num_tokens > stride:
             # Falling back here alone would desynchronize the ranks.
             raise RuntimeError(
