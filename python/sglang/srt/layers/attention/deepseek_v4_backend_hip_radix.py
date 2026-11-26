@@ -879,6 +879,7 @@ class DeepseekV4HipRadixBackend(
 ):
     # DSV4 TBO runs only in eager prefill; driving TBO children through graph
     # capture/replay leaks ROCm HSA resources (HSA_STATUS_ERROR_OUT_OF_RESOURCES).
+    # SGLANG_ENABLE_TBO_DECODE splits the decode graphs and drives them anyway.
     tbo_supports_cuda_graph = False
     supports_prefill_cuda_graph_max_context_size = True
     supports_ragged_verify_graph: bool = True
@@ -1905,7 +1906,12 @@ class DeepseekV4HipRadixBackend(
         if (
             get_parallel().attn_cp_size != 1
             or getattr(forward_batch, "tbo_children", None)
-            or getattr(forward_batch, "tbo_parent_token_range", None) is not None
+            or (
+                getattr(forward_batch, "tbo_parent_token_range", None) is not None
+                # A target-verify micro-batch (SGLANG_ENABLE_TBO_DECODE) can be graph
+                # captured, where only this workspace keeps AITER's scheduler out.
+                and forward_batch.forward_mode != ForwardMode.TARGET_VERIFY
+            )
         ):
             return
 

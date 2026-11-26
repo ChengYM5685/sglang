@@ -13,6 +13,7 @@ from sglang.srt.batch_overlap.operations import (
     execute_overlapped_operations,
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.layer_boundary import (
     Layout,
@@ -56,6 +57,20 @@ _is_hip = is_hip()
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 
 logger = logging.getLogger(__name__)
+
+
+def is_decode_tbo_enabled() -> bool:
+    """SGLANG_ENABLE_TBO_DECODE: a model whose TBO is prefill-only (DeepSeek-V4) also
+    splits decode and target-verify steps, eager and CUDA-graph captured."""
+    return is_tbo_enabled() and envs.SGLANG_ENABLE_TBO_DECODE.get()
+
+
+def graph_splits_batch(batch_size: int) -> bool:
+    """Whether a decode-family CUDA graph of batch_size requests runs split. Under
+    SGLANG_ENABLE_TBO_DECODE a one-request graph stays whole: splitting it leaves
+    the first micro-batch empty and overlaps nothing. Every DP rank replays the
+    same graph size, so they all agree."""
+    return batch_size >= 2 or not is_decode_tbo_enabled()
 
 
 # -------------------------------- Compute Basic Info ---------------------------------------
@@ -198,6 +213,37 @@ def _update_device_and_sum_field_from_cpu_field(
         setattr(batch, sum_field, sum_value)
 
 
+def _splits_dflash_verify_input(spec_info: SpecInput) -> bool:
+    """Whether split_spec_info splits this DFlash / DSpark verify input: a linear
+    block of draft_token_num rows per request, without a custom mask or a ragged
+    layout, under SGLANG_ENABLE_TBO_DECODE."""
+    from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+    return (
+        isinstance(spec_info, DFlashVerifyInput)
+        and spec_info.custom_mask is None
+        and spec_info.ragged_verify_layout is None
+        and is_decode_tbo_enabled()
+    )
+
+
+def _split_dflash_verify_input(spec_info, *, seqs: slice, tokens: slice):
+    # Graph capture passes inputs whose draft_token / positions are still None.
+    def _rows(x, rows):
+        return None if x is None else x[rows]
+
+    iteration_cols = spec_info.iteration_cols
+    if spec_info.iteration_ids is not None:
+        iteration_cols = spec_info.iteration_ids.cols_slice(iteration_cols, tokens)
+    return replace(
+        spec_info,
+        draft_token=_rows(spec_info.draft_token, tokens),
+        positions=_rows(spec_info.positions, tokens),
+        live_seq_lens_cpu=_rows(spec_info.live_seq_lens_cpu, seqs),
+        iteration_cols=iteration_cols,
+    )
+
+
 def _compute_mask_offset(seq_index: int, spec_info: Optional[EagleVerifyInput]) -> int:
     if seq_index == 0:
         return 0
@@ -220,6 +266,12 @@ def split_spec_info(
 ):
     if spec_info is None:
         return None
+    if _splits_dflash_verify_input(spec_info):
+        return _split_dflash_verify_input(
+            spec_info,
+            seqs=slice(start_seq_index, end_seq_index),
+            tokens=slice(start_token_index, end_token_index),
+        )
     if spec_info.draft_token is not None:
         draft_token = spec_info.draft_token[start_token_index:end_token_index]
     else:
@@ -337,8 +389,9 @@ def compute_split_indices_for_cuda_graph_replay(
 
 def _verify_input_blocks_split(batch) -> bool:
     """A verify step (idle DP ranks carry the same input) whose spec input
-    split_spec_info cannot split: it only splits EagleVerifyInput (dataclasses.replace
-    over EAGLE's fields), not e.g. DSpark's DFlashVerifyInput or NgramVerifyInput.
+    split_spec_info cannot split: it splits EagleVerifyInput (dataclasses.replace
+    over EAGLE's fields) and, under SGLANG_ENABLE_TBO_DECODE, DSpark's linear
+    DFlashVerifyInput, not e.g. NgramVerifyInput.
     Every rank runs it without TBO so the MoE collectives still pair up."""
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -348,6 +401,7 @@ def _verify_input_blocks_split(batch) -> bool:
         and spec_info is not None
         and spec_info.is_verify_input()
         and not isinstance(spec_info, EagleVerifyInput)
+        and not _splits_dflash_verify_input(spec_info)
     )
 
 
@@ -360,10 +414,14 @@ class TboCudaGraphRunnerPlugin:
         self._is_draft_worker = is_draft_worker
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
+        is_decode_family = (
+            batch.forward_mode.is_decode() or batch.forward_mode.is_target_verify()
+        )
         if (
             not is_tbo_enabled()
             or self._is_draft_worker
             or _verify_input_blocks_split(batch)
+            or (is_decode_family and not graph_splits_batch(batch.batch_size))
         ):
             return
         token_num_per_seq = get_token_num_per_seq(
@@ -378,6 +436,13 @@ class TboCudaGraphRunnerPlugin:
         )
         # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
         assert batch.tbo_split_seq_index is not None, f"{num_tokens=}"
+        if is_decode_tbo_enabled() and batch.global_num_tokens_cpu is not None:
+            # Every DP rank replays one graph size with this split, so these are
+            # each rank's exact first-micro-batch rows (bounding its MoE receive).
+            split_rows = TboForwardBatchPreparer._compute_split_token_index(batch)
+            batch.global_tbo_split_num_tokens = [split_rows] * len(
+                batch.global_num_tokens_cpu
+            )
 
         self._tbo_children_num_token_non_padded[...] = (
             TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)

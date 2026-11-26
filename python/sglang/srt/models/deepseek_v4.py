@@ -4415,8 +4415,10 @@ class DeepseekV4Model(nn.Module):
         TBO). We additionally restrict to prefill (EXTEND), single PP, and
         non-CP paths supported by the DSV4 op strategy. The non-EP strategy
         uses variable-size DP collectives and therefore requires CP1,
-        multi-rank DP, and SUM_LEN padding.
+        multi-rank DP, and SUM_LEN padding. SGLANG_ENABLE_TBO_DECODE adds
+        decode and target-verify steps on the EP path.
         """
+        from sglang.srt.batch_overlap.two_batch_overlap import is_decode_tbo_enabled
         from sglang.srt.layers.moe import is_tbo_enabled
 
         path_ok = not is_cp_active(forward_batch) and (
@@ -4428,14 +4430,23 @@ class DeepseekV4Model(nn.Module):
                 and forward_batch.dp_padding_mode.is_sum_len()
             )
         )
+        mode = forward_batch.global_forward_mode
+        # MTP target-verify also reports is_extend(); only real prefill
+        # should enter the prefill TBO strategy.
+        mode_ok = mode is not None and (
+            mode.is_extend_without_speculative()
+            # A DSpark verify step is still DECODE in the scheduler's gathered mode.
+            or (
+                (mode.is_decode() or mode.is_target_verify())
+                and is_decode_tbo_enabled()
+                and not get_moe_a2a_backend().is_none()
+            )
+        )
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
             and forward_batch.tbo_children is not None
-            and forward_batch.global_forward_mode is not None
-            # MTP target-verify also reports is_extend(); only real prefill
-            # should enter the prefill TBO strategy.
-            and forward_batch.global_forward_mode.is_extend_without_speculative()
+            and mode_ok
             and path_ok
             and self.pp_group.world_size == 1
         )

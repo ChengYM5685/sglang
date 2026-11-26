@@ -175,12 +175,19 @@ def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
 ) -> OperationsStrategy:
     if forward_mode == ForwardMode.EXTEND:
         return _compute_moe_deepseek_v4_prefill(layer)
-    else:
-        # Decode TBO for DSV4 is not implemented yet (ATOM data: decode TBO
-        # regresses; needs cuda-graph capture work). Prefill-only for now.
-        raise NotImplementedError(
-            f"DeepseekV4 TBO only supports prefill (EXTEND), got {forward_mode=}"
-        )
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+
+    if forward_mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY) and (
+        not get_moe_a2a_backend().is_none()
+    ):
+        # SGLANG_ENABLE_TBO_DECODE (DeepseekV4Model._can_run_tbo): decode and
+        # target-verify take the EP prefill schedule, each a2a leg hidden behind
+        # the other micro-batch's attention or experts.
+        return _compute_moe_deepseek_v4_prefill(layer)
+    raise NotImplementedError(
+        f"DeepseekV4 TBO supports EXTEND, and DECODE / TARGET_VERIFY on the EP "
+        f"path, got {forward_mode=}"
+    )
 
 
 def _compute_moe_deepseek_v4_prefill(layer):

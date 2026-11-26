@@ -864,6 +864,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     global_num_tokens_for_logprob_source,
                 )
             )
+            if self.global_tbo_split_num_tokens is not None:
+                # Gathered in the same request units as the decode-family counts.
+                self.global_tbo_split_num_tokens = [
+                    x * self.spec_info.num_tokens_per_req
+                    for x in self.global_tbo_split_num_tokens
+                ]
         else:
             global_num_tokens = global_num_tokens_source
             global_num_tokens_for_logprob = global_num_tokens_for_logprob_source

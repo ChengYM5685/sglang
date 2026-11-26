@@ -522,6 +522,9 @@ class Envs:
     # every busy iteration, with or without the BUSY flag.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
+    # With --enable-two-batch-overlap, models whose TBO is prefill-only (DeepSeek-V4)
+    # also split decode and target-verify steps, CUDA-graph captured ones included.
+    SGLANG_ENABLE_TBO_DECODE = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)

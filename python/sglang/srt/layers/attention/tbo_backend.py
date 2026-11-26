@@ -63,8 +63,12 @@ class TboAttnBackend(AttentionBackend):
         indexer) leaks ROCm HSA resources across the 2 children -> eventual
         HSA_STATUS_ERROR_OUT_OF_RESOURCES. Eager prefill TBO (init_forward_metadata)
         is unaffected; only the *_graph paths are gated.
+        SGLANG_ENABLE_TBO_DECODE splits those graphs too, so their children take part.
         """
-        return getattr(self.primary, "tbo_supports_cuda_graph", True)
+        return (
+            getattr(self.primary, "tbo_supports_cuda_graph", True)
+            or two_batch_overlap.is_decode_tbo_enabled()
+        )
 
     def init_forward_metadata_out_graph(
         self,
@@ -95,6 +99,8 @@ class TboAttnBackend(AttentionBackend):
 
     def _dispatch_children_from_replay_view(self, fb_view) -> None:
         bs = fb_view.batch_size
+        if not two_batch_overlap.graph_splits_batch(bs):
+            return
         forward_mode = fb_view.forward_mode
         spec_info = fb_view.spec_info
         token_num_per_seq = two_batch_overlap.get_token_num_per_seq(
