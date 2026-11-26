@@ -44,6 +44,10 @@ def _verify_input(bs: int, **kwargs) -> DFlashVerifyInput:
     )
 
 
+# A backend that verifies causally and never reads the verify mask, like DSV4 HIP.
+_DSV4_LIKE = SimpleNamespace(dflash_verify_ignores_custom_mask=True)
+
+
 def _decode_tbo(on: bool):
     return envs.SGLANG_ENABLE_TBO_DECODE.override(on)
 
@@ -62,17 +66,36 @@ class TestDFlashVerifySplit(CustomTestCase):
                 with _decode_tbo(True):
                     self.assertFalse(_verify_input_blocks_split(batch))
 
-    def test_masked_or_ragged_verify_still_blocks(self):
-        for kwargs in (
-            dict(custom_mask=torch.ones(4, dtype=torch.bool)),
-            dict(ragged_verify_layout=object()),
+    def test_masked_verify_splits_only_for_a_backend_that_ignores_the_mask(self):
+        """Graph capture and idle replays hand DSV4 the runner's mask buffer; the
+        mask is not cut per request, so only a backend that never reads it splits."""
+        mask = torch.ones(4, dtype=torch.bool)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=_verify_input(4, custom_mask=mask),
+        )
+        for backend, blocks in (
+            (SimpleNamespace(), True),
+            (_DSV4_LIKE, False),
+            (Mock(spec=TboAttnBackend, primary=_DSV4_LIKE), False),
         ):
-            batch = SimpleNamespace(
-                forward_mode=ForwardMode.TARGET_VERIFY,
-                spec_info=_verify_input(4, **kwargs),
-            )
-            with self.subTest(kwargs=list(kwargs)), _tbo_on(), _decode_tbo(True):
-                self.assertTrue(_verify_input_blocks_split(batch))
+            with (
+                self.subTest(backend=backend),
+                _tbo_on(),
+                _decode_tbo(True),
+                patch.object(
+                    two_batch_overlap, "get_attn_backend", return_value=backend
+                ),
+            ):
+                self.assertEqual(_verify_input_blocks_split(batch), blocks)
+
+    def test_ragged_verify_still_blocks(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=_verify_input(4, ragged_verify_layout=object()),
+        )
+        with _tbo_on(), _decode_tbo(True):
+            self.assertTrue(_verify_input_blocks_split(batch))
 
     def test_split_by_request(self):
         spec_info = _verify_input(5)
@@ -198,7 +221,7 @@ class TestDecodeTboGraphReplay(CustomTestCase):
 
     def test_replay_splits_padded_verify_view_by_request(self):
         children = [Mock(), Mock()]
-        backend = SimpleNamespace(children=children)
+        backend = SimpleNamespace(children=children, primary=_DSV4_LIKE)
         # A 4-request graph replaying 3 live requests: the second child is padding
         # past the live write locations.
         view = self._replay_view(bs=4, raw_tokens=3 * W)
@@ -213,9 +236,32 @@ class TestDecodeTboGraphReplay(CustomTestCase):
         self.assertEqual(child_b.out_cache_loc.shape[0], W)
         self.assertFalse(any(v["in_capture"] for v in views))
 
+    def test_idle_replay_with_the_mask_buffer_splits(self):
+        """An idle rank's replay carries the runner's mask buffer on its verify input
+        and must split like the busy ranks, or the MoE collectives do not pair up."""
+        children = [Mock(), Mock()]
+        backend = SimpleNamespace(children=children, primary=_DSV4_LIKE)
+        view = self._replay_view(bs=4, raw_tokens=0)
+        view.actual_forward_mode = ForwardMode.IDLE
+        mask = torch.ones(64, dtype=torch.bool)
+        view.spec_info = DFlashVerifyInput(
+            draft_token=torch.empty(0, dtype=torch.long),
+            positions=torch.empty(0, dtype=torch.long),
+            draft_token_num=W,
+            custom_mask=mask,
+        )
+        with _tbo_on(), _decode_tbo(True):
+            TboAttnBackend._dispatch_children_from_replay_view(backend, view)
+        for child in children:
+            child_view = child.init_forward_metadata_out_graph.call_args.kwargs[
+                "forward_batch"
+            ]
+            self.assertIs(child_view.spec_info.custom_mask, mask)
+            self.assertEqual(child_view.actual_forward_mode, ForwardMode.IDLE)
+
     def test_replay_of_whole_one_request_graph_skips_children(self):
         children = [Mock(), Mock()]
-        backend = SimpleNamespace(children=children)
+        backend = SimpleNamespace(children=children, primary=_DSV4_LIKE)
         with _tbo_on(), _decode_tbo(True):
             TboAttnBackend._dispatch_children_from_replay_view(
                 backend, self._replay_view(bs=1, raw_tokens=W)

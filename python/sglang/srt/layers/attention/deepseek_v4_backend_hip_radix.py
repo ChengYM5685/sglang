@@ -881,6 +881,9 @@ class DeepseekV4HipRadixBackend(
     # capture/replay leaks ROCm HSA resources (HSA_STATUS_ERROR_OUT_OF_RESOURCES).
     # SGLANG_ENABLE_TBO_DECODE splits the decode graphs and drives them anyway.
     tbo_supports_cuda_graph = False
+    # Target verify attends causally over each request's draft block and never reads
+    # spec_info.custom_mask, so TBO may split a DFlash verify input that carries one.
+    dflash_verify_ignores_custom_mask = True
     supports_prefill_cuda_graph_max_context_size = True
     supports_ragged_verify_graph: bool = True
     # each bucket keeps one metadata object; the captured segments read the SWA store target by address

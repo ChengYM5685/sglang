@@ -213,22 +213,37 @@ def _update_device_and_sum_field_from_cpu_field(
         setattr(batch, sum_field, sum_value)
 
 
-def _splits_dflash_verify_input(spec_info: SpecInput) -> bool:
-    """Whether split_spec_info splits this DFlash / DSpark verify input: a linear
-    block of draft_token_num rows per request, without a custom mask or a ragged
-    layout, under SGLANG_ENABLE_TBO_DECODE."""
+def _splits_dflash_verify_input(spec_info: SpecInput, attn_backend=None) -> bool:
+    """Whether split_spec_info splits this DFlash / DSpark verify input, a linear
+    block of draft_token_num rows per request, under SGLANG_ENABLE_TBO_DECODE.
+    attn_backend defaults to the forward context's."""
     from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
-    return (
+    if not (
         isinstance(spec_info, DFlashVerifyInput)
-        and spec_info.custom_mask is None
         and spec_info.ragged_verify_layout is None
         and is_decode_tbo_enabled()
+    ):
+        return False
+    # Its custom mask is not cut per request, so a masked input splits only for a
+    # backend that never reads the mask; graph capture and idle replays hand every
+    # backend the runner's mask buffer.
+    return spec_info.custom_mask is None or _ignores_dflash_verify_mask(
+        attn_backend if attn_backend is not None else get_attn_backend()
     )
 
 
+def _ignores_dflash_verify_mask(attn_backend) -> bool:
+    from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+    if isinstance(attn_backend, TboAttnBackend):
+        attn_backend = attn_backend.primary
+    return getattr(attn_backend, "dflash_verify_ignores_custom_mask", False)
+
+
 def _split_dflash_verify_input(spec_info, *, seqs: slice, tokens: slice):
-    # Graph capture passes inputs whose draft_token / positions are still None.
+    # Graph capture passes inputs whose draft_token / positions are still None;
+    # custom_mask stays whole (_splits_dflash_verify_input).
     def _rows(x, rows):
         return None if x is None else x[rows]
 
@@ -263,10 +278,11 @@ def split_spec_info(
     end_seq_index: int,
     start_token_index: int,
     end_token_index: int,
+    attn_backend=None,
 ):
     if spec_info is None:
         return None
-    if _splits_dflash_verify_input(spec_info):
+    if _splits_dflash_verify_input(spec_info, attn_backend):
         return _split_dflash_verify_input(
             spec_info,
             seqs=slice(start_seq_index, end_seq_index),

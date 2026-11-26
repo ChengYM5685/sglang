@@ -139,6 +139,7 @@ class TboAttnBackend(AttentionBackend):
                 seq_slice=seq_slice,
                 tok_slice=tok_slice,
                 token_num_per_seq=token_num_per_seq,
+                attn_backend=self.primary,
             )
             child.init_forward_metadata_out_graph(
                 forward_batch=child_fb_view, in_capture=False
@@ -247,6 +248,7 @@ def _build_tbo_child_replay_fb_view(
     seq_slice: slice,
     tok_slice: slice,
     token_num_per_seq: int,
+    attn_backend: AttentionBackend,
 ) -> SimpleNamespace:
     """Slice a parent replay fb_view into a per-child view.
 
@@ -269,6 +271,7 @@ def _build_tbo_child_replay_fb_view(
             end_seq_index=end_seq,
             start_token_index=start_seq * token_num_per_seq,
             end_token_index=end_seq * token_num_per_seq,
+            attn_backend=attn_backend,
         )
     else:
         child_spec_info = None
