@@ -814,6 +814,11 @@ def init_mori_epv2_op(
         + (
             f" own_sdma_queue={cfg_kwargs.get('async_ll_own_sdma_queue', False)}"
             f" recv_layout={getattr(op.cfg, 'async_ll_recv_layout', 'compact')}"
+            # Resolved by MORI from MORI_ASYNCLL_* (ROCm/mori#1105); None on builds
+            # without them. asyncll_mode: 0 legacy, 1 early notify, 2 fused wait.
+            f" direct={getattr(op, '_asyncll_direct_on', None)}"
+            f" asyncll_mode={getattr(op, '_asyncll_mode', None)}"
+            f" fuse_meta={getattr(op, '_asyncll_fuse_meta_on', None)}"
             if async_ll
             else ""
         )
