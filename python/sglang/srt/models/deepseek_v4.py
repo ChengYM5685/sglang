@@ -289,6 +289,9 @@ def get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
+# (forward mode, graph capture) pairs whose first split forward was logged.
+_logged_decode_tbo: set = set()
+
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
@@ -3697,6 +3700,22 @@ def _finalize_dspark_aux(
     return _scatter_tail_rows(tail=tail, rows=packed, num_tokens=num_tokens, zero=True)
 
 
+def _log_first_decode_tbo(forward_batch: ForwardBatch) -> None:
+    """Log once per mode that a decode / target-verify step really ran split
+    (SGLANG_ENABLE_TBO_DECODE); a captured graph replays the split every step."""
+    mode = forward_batch.forward_mode
+    key = (mode, torch.cuda.is_current_stream_capturing())
+    if mode.is_extend_without_speculative() or key in _logged_decode_tbo:
+        return
+    _logged_decode_tbo.add(key)
+    child_a, child_b = forward_batch.tbo_children
+    logger.info(
+        f"DSV4 decode TBO: {mode.name} split into {child_a.batch_size} + "
+        f"{child_b.batch_size} requests ({child_a.tbo_padded_len} + "
+        f"{child_b.tbo_padded_len} rows), graph capture={key[1]}"
+    )
+
+
 class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
     """CUDA execution with declared residual reads and writes."""
 
@@ -4470,6 +4489,7 @@ class DeepseekV4Model(nn.Module):
         operations_strategy = OperationsStrategy.init_new_tbo(
             layers, forward_batch.global_forward_mode
         )
+        _log_first_decode_tbo(forward_batch)
 
         # Split the per-rank batch into the 2 ubatches (token-range slice + pad
         # to tbo_padded_len). residual is unused by the DSV4 non-fused layer ops.
