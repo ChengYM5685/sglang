@@ -157,6 +157,16 @@ def segmented_rows_fit(*, stride: int, ep_size: int, total_rows: int) -> bool:
     )
 
 
+def _asyncll_recv_layout() -> str:
+    layout = envs.SGLANG_MORI_ASYNCLL_RECV_LAYOUT.get()
+    if layout not in ("auto", "segmented", "compact"):
+        raise ValueError(
+            "SGLANG_MORI_ASYNCLL_RECV_LAYOUT must be auto, segmented or compact; "
+            f"got {layout!r}"
+        )
+    return layout
+
+
 def _max_dispatch_tokens_per_rank() -> int:
     return mori_max_dispatch_tokens_per_rank(get_server_args())
 
@@ -753,15 +763,16 @@ def init_mori_epv2_op(
         cfg_fields = EpDispatchCombineConfig.__dataclass_fields__
         if async_ll_transport == "sdma" and "async_ll_own_sdma_queue" in cfg_fields:
             cfg_kwargs.update(async_ll_own_sdma_queue=True)
-        # The segmented receive layout needs no switch: "auto" lets
-        # MORI build it only where this op's config supports it. fp8/fp4 dispatch
-        # can be dequantized before the MoE; kept to the measured dtypes.
+        recv_layout = _asyncll_recv_layout()
+        # "auto" lets MORI build the segmented layout only where this op's config
+        # supports it. fp8/fp4 dispatch can be dequantized before the MoE; kept to
+        # the measured dtypes.
         if (
             async_ll_transport == "sdma"
             and "async_ll_recv_layout" in cfg_fields
             and dispatch_dtype in (DispatchDtype.bf16, DispatchDtype.mxfp8)
         ):
-            cfg_kwargs.update(async_ll_recv_layout="auto")
+            cfg_kwargs.update(async_ll_recv_layout=recv_layout)
     cfg = EpDispatchCombineConfig(
         **cfg_kwargs,
         # Only the hip backend has the AsyncLL kernels; gfx950 defaults to flydsl,

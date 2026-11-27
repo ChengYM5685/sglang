@@ -204,6 +204,21 @@ class TestMoriSegmentedRowsFit(CustomTestCase):
         self.assertFalse(fit(stride=32, ep_size=8, total_rows=0))
 
 
+class TestMoriAsyncLLRecvLayout(CustomTestCase):
+    """Unset keeps every server on "auto" (segmented where MORI supports it); a
+    misspelt layout raises instead of being dropped where MORI never sees it."""
+
+    def test_default_and_invalid(self):
+        with patch.dict(os.environ):
+            envs.SGLANG_MORI_ASYNCLL_RECV_LAYOUT.clear()
+            self.assertEqual(moriep._asyncll_recv_layout(), "auto")
+            with envs.SGLANG_MORI_ASYNCLL_RECV_LAYOUT.override("compact"):
+                self.assertEqual(moriep._asyncll_recv_layout(), "compact")
+            with envs.SGLANG_MORI_ASYNCLL_RECV_LAYOUT.override("compat"):
+                with self.assertRaises(ValueError):
+                    moriep._asyncll_recv_layout()
+
+
 class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
     """--enable-two-batch-overlap must only change the calls that belong to a TBO
     micro-batch; decode, verify and unsplit prefill forwards of the same server

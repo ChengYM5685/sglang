@@ -1030,6 +1030,9 @@ class Envs:
     SGLANG_MORI_DISPATCH_DTYPE = EnvStr("auto")
     SGLANG_MORI_COMBINE_DTYPE = EnvStr("auto")
     SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS = EnvInt(0)
+    # AsyncLL receive layout on single-node SDMA: auto, segmented or compact.
+    # compact gives up the segmented prefill receive; only for decode-only servers.
+    SGLANG_MORI_ASYNCLL_RECV_LAYOUT = EnvStr("auto")
     # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
     # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.
     SGLANG_MORI_RECV_BOUND = EnvBool(False)
