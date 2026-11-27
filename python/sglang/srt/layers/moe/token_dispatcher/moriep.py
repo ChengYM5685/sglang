@@ -819,6 +819,7 @@ def init_mori_epv2_op(
             f" direct={getattr(op, '_asyncll_direct_on', None)}"
             f" asyncll_mode={getattr(op, '_asyncll_mode', None)}"
             f" fuse_meta={getattr(op, '_asyncll_fuse_meta_on', None)}"
+            f" compact_reserve={getattr(op, '_asyncll_reserve_on', None)}"
             if async_ll
             else ""
         )
